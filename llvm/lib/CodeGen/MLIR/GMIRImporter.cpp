@@ -20,6 +20,7 @@
 #include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Alignment.h"
 
@@ -376,6 +377,15 @@ private:
     llvm::Type *PtrIRTy = LI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    // Mirrors TargetLoweringBase::getLoadMemOperandFlags's MOInvariant/
+    // MONonTemporal derivation exactly -- see gmir.load's doc comment for
+    // why MODereferenceable isn't modeled alongside these.
+    mlir::UnitAttr IsInvariant = LI.hasMetadata(LLVMContext::MD_invariant_load)
+                                     ? Builder.getUnitAttr()
+                                     : mlir::UnitAttr();
+    mlir::UnitAttr IsNonTemporal = LI.hasMetadata(LLVMContext::MD_nontemporal)
+                                       ? Builder.getUnitAttr()
+                                       : mlir::UnitAttr();
     SmallVector<mlir::Value, 1> Results;
     for (auto [LeafTy, Offset] : zip(LeafTypes, Offsets)) {
       mlir::Value LeafPtr =
@@ -386,7 +396,8 @@ private:
           Builder.getI64IntegerAttr(LeafAlign.value()),
           Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getOrdering())),
           Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getSyncScopeID())),
-          LI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr());
+          LI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          IsInvariant, IsNonTemporal);
       Results.push_back(Op.getResult());
     }
     ValueMap[&LI] = std::move(Results);
@@ -410,6 +421,11 @@ private:
     llvm::Type *PtrIRTy = SI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    // Mirrors TargetLoweringBase::getStoreMemOperandFlags's MONonTemporal
+    // derivation exactly.
+    mlir::UnitAttr IsNonTemporal = SI.hasMetadata(LLVMContext::MD_nontemporal)
+                                       ? Builder.getUnitAttr()
+                                       : mlir::UnitAttr();
     for (auto [ValueLeaf, Offset] : zip(ValueLeaves, Offsets)) {
       mlir::Value LeafPtr =
           materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
@@ -419,7 +435,8 @@ private:
           Builder.getI64IntegerAttr(LeafAlign.value()),
           Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getOrdering())),
           Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
-          SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr());
+          SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          IsNonTemporal);
     }
     return true;
   }

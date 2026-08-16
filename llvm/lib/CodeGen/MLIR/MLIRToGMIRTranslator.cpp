@@ -293,10 +293,15 @@ private:
       Register PtrReg = ValueToReg.lookup(Load.getPtr());
       LLT Ty = convertLLT(cast<gmir::LLTType>(Load.getResult().getType()), DL);
       Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
-      MachineMemOperand *MMO =
-          buildMMO(MachineMemOperand::MOLoad, Ty, Load.getAlignAttr().getInt(),
-                   Load.getOrderingAttr().getInt(),
-                   Load.getSyncscopeAttr().getInt(), Load.getIsVolatile());
+      MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
+      if (Load.getIsInvariant())
+        ExtraFlags |= MachineMemOperand::MOInvariant;
+      if (Load.getIsNonTemporal())
+        ExtraFlags |= MachineMemOperand::MONonTemporal;
+      MachineMemOperand *MMO = buildMMO(
+          MachineMemOperand::MOLoad | ExtraFlags, Ty,
+          Load.getAlignAttr().getInt(), Load.getOrderingAttr().getInt(),
+          Load.getSyncscopeAttr().getInt(), Load.getIsVolatile());
       MIRBuilder.buildLoad(Res, PtrReg, *MMO);
       ValueToReg[Load.getResult()] = Res;
       return true;
@@ -306,10 +311,13 @@ private:
       Register ValReg = ValueToReg.lookup(Store.getValue());
       Register PtrReg = ValueToReg.lookup(Store.getPtr());
       LLT Ty = convertLLT(cast<gmir::LLTType>(Store.getValue().getType()), DL);
+      MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
+      if (Store.getIsNonTemporal())
+        ExtraFlags |= MachineMemOperand::MONonTemporal;
       MachineMemOperand *MMO = buildMMO(
-          MachineMemOperand::MOStore, Ty, Store.getAlignAttr().getInt(),
-          Store.getOrderingAttr().getInt(), Store.getSyncscopeAttr().getInt(),
-          Store.getIsVolatile());
+          MachineMemOperand::MOStore | ExtraFlags, Ty,
+          Store.getAlignAttr().getInt(), Store.getOrderingAttr().getInt(),
+          Store.getSyncscopeAttr().getInt(), Store.getIsVolatile());
       MIRBuilder.buildStore(ValReg, PtrReg, *MMO);
       return true;
     }
@@ -393,18 +401,19 @@ private:
     return true;
   }
 
-  /// Shared MMO construction for gmir.load/gmir.store. MachinePointerInfo
-  /// is left "unknown" (no Value-based provenance) and AAMDNodes are left
-  /// empty -- a deliberate M3 scope exclusion (see design doc §1.5):
-  /// unlike ordering (a correctness-affecting field once atomics are in
-  /// play), AA metadata is a pure optimization hint, safe to omit, and not
-  /// carried through gmir today. Same reasoning covers MOInvariant/
-  /// MODereferenceable/MONonTemporal (TargetLoweringBase::
-  /// getLoadMemOperandFlags/getStoreMemOperandFlags derive these from
-  /// !invariant.load/!nontemporal/etc IR metadata, which gmir.load/
-  /// gmir.store don't carry either) -- all pure codegen-quality hints,
-  /// never correctness, and out of scope until something actually needs
-  /// them.
+  /// Shared MMO construction for gmir.load/gmir.store. MOInvariant/
+  /// MONonTemporal (set by the two callers above, from gmir.load/store's
+  /// isInvariant/isNonTemporal attrs) are passed in via BaseFlags,
+  /// mirroring TargetLoweringBase::getLoadMemOperandFlags/
+  /// getStoreMemOperandFlags exactly. MachinePointerInfo is left "unknown"
+  /// (no Value-based provenance), AAMDNodes are left empty, and
+  /// MODereferenceable is never set -- a deliberate, still-scoped-out
+  /// exclusion (see design doc §1.5 for AAMDNodes, gmir.load's doc comment
+  /// for MODereferenceable specifically): all pure codegen-quality hints,
+  /// never correctness, and the remaining ones are either analysis-
+  /// dependent (MODereferenceable) or genuinely not carried through gmir
+  /// yet (AA metadata) rather than a simple presence check like the two
+  /// that are now implemented.
   MachineMemOperand *buildMMO(MachineMemOperand::Flags BaseFlags, LLT Ty,
                               int64_t AlignBytes, int64_t OrderingVal,
                               int64_t SyncScopeVal, bool IsVolatile) {

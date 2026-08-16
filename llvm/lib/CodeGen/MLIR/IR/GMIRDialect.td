@@ -156,9 +156,20 @@ def GMIR_LoadOp : GMIR_Op<"load",
     leaf (each with its own already-resolved offset pointer and alignment)
     rather than a single multi-result op -- mirrors IRTranslator's
     multi-register loop, not a new gmir-level aggregate concept.
+
+    `isInvariant`/`isNonTemporal` mirror `TargetLoweringBase::
+    getLoadMemOperandFlags`'s `MOInvariant`/`MONonTemporal` derivation from
+    the source `!invariant.load`/`!nontemporal` metadata -- a plain
+    presence check, no analysis dependency, unlike `MODereferenceable`
+    (deliberately not modeled here: the real derivation needs
+    `isDereferenceableAndAlignedPointer`, which needs `AssumptionCache`/
+    `TargetLibraryInfo` that the importer doesn't have threaded in, and
+    the cheaper `!dereferenceable`-metadata-only fallback is narrow enough
+    not to be worth the op-shape churn until something needs it).
   }];
   let arguments = (ins GMIR_LLTType:$ptr, I64Attr:$align, I64Attr:$ordering,
-                       I64Attr:$syncscope, UnitAttr:$isVolatile);
+                       I64Attr:$syncscope, UnitAttr:$isVolatile,
+                       UnitAttr:$isInvariant, UnitAttr:$isNonTemporal);
   let results = (outs GMIR_LLTType:$res);
 }
 
@@ -168,10 +179,13 @@ def GMIR_StoreOp : GMIR_Op<"store",
   let description = [{
     See `gmir.load` for the `ordering`/`syncscope` attribute convention and
     the "one op per flattened leaf" aggregate-decomposition approach.
+    `isNonTemporal` mirrors `TargetLoweringBase::getStoreMemOperandFlags`
+    exactly (which, unlike the load side, has no invariant or
+    dereferenceable concept for stores at all).
   }];
   let arguments = (ins GMIR_LLTType:$value, GMIR_LLTType:$ptr, I64Attr:$align,
                        I64Attr:$ordering, I64Attr:$syncscope,
-                       UnitAttr:$isVolatile);
+                       UnitAttr:$isVolatile, UnitAttr:$isNonTemporal);
 }
 
 def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {

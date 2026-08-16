@@ -66,3 +66,24 @@ entry:
   store atomic i32 %v, ptr %p seq_cst, align 4
   ret void
 }
+
+define i32 @invariant_load(ptr %p) {
+entry:
+  %v = load i32, ptr %p, !invariant.load !0
+  ret i32 %v
+}
+
+define i32 @nontemporal_load(ptr %p) {
+entry:
+  %v = load i32, ptr %p, !nontemporal !1
+  ret i32 %v
+}
+
+define void @nontemporal_store(ptr %p, i32 %v) {
+entry:
+  store i32 %v, ptr %p, !nontemporal !1
+  ret void
+}
+
+!0 = !{}
+!1 = !{i32 1}
