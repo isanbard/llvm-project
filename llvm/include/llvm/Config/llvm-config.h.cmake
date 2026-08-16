@@ -24,6 +24,10 @@
 /* Define if threads enabled */
 #cmakedefine01 LLVM_ENABLE_THREADS
 
+/* Define if the experimental MLIR-based instruction-selection pipeline is
+   built (see llvm/lib/CodeGen/MLIR/) */
+#cmakedefine01 LLVM_ENABLE_MLIR_ISEL
+
 /* Has gcc/MSVC atomic intrinsics */
 #cmakedefine01 LLVM_HAS_ATOMICS
 

@@ -42,6 +42,21 @@ add_llvm_tool_subdirectory(llvm-readobj)
 # specified.
 add_llvm_external_project(lld)
 add_llvm_external_project(mlir)
+
+# The experimental MLIR-based instruction-selection pipeline
+# (llvm/lib/CodeGen/MLIR/) needs MLIR's CMake machinery (mlir_tablegen, MLIR
+# library targets), which isn't available while llvm/lib/ is processed --
+# only mlir's own CMakeLists.txt (just added above) loads it. So, like
+# ClangIR, its CMakeLists.txt is invoked from here instead, after mlir, even
+# though its sources live under llvm/lib/. See
+# llvm/include/llvm/CodeGen/MLIRISel.h for how this avoids a link cycle with
+# libLLVMCodeGen. llc (added below via add_llvm_implicit_projects) links it
+# in conditionally.
+if (LLVM_ENABLE_MLIR_ISEL)
+  add_subdirectory(${LLVM_MAIN_SRC_DIR}/lib/CodeGen/MLIR
+                    ${LLVM_BINARY_DIR}/lib/CodeGen/MLIR)
+endif()
+
 # ClangIR and Flang depend on mlir, lldb and Flang depend on clang, sort them
 # accordingly so place them afterwards
 add_llvm_external_project(clang)

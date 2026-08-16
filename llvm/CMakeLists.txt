@@ -208,6 +208,11 @@ if ("lldb" IN_LIST LLVM_ENABLE_PROJECTS)
   endif()
 endif ()
 
+option(LLVM_ENABLE_MLIR_ISEL "Build the experimental MLIR-based instruction selection pipeline" OFF)
+if (LLVM_ENABLE_MLIR_ISEL AND NOT "mlir" IN_LIST LLVM_ENABLE_PROJECTS)
+  message(FATAL_ERROR "Cannot build MLIR ISel without MLIR in LLVM_ENABLE_PROJECTS")
+endif()
+
 if ("libc" IN_LIST LLVM_ENABLE_PROJECTS)
   message(WARNING "Using LLVM_ENABLE_PROJECTS=libc is deprecated now, and will "
     "become a fatal error in a future release. Please use "

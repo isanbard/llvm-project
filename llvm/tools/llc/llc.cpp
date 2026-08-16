@@ -22,10 +22,12 @@
 #include "llvm/CodeGen/LinkAllAsmWriterComponents.h"
 #include "llvm/CodeGen/LinkAllCodegenComponents.h"
 #include "llvm/CodeGen/MIRParser/MIRParser.h"
+#include "llvm/CodeGen/MLIRISel.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/AutoUpgrade.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -378,6 +380,13 @@ int main(int argc, char **argv) {
   InitializeAllTargetMCs();
   InitializeAllAsmPrinters();
   InitializeAllAsmParsers();
+
+#if LLVM_ENABLE_MLIR_ISEL
+  // Installs the real createMLIRInstructionSelectPass() factory (see
+  // llvm/include/llvm/CodeGen/MLIRISel.h); only ever declared/linked when
+  // this build was configured with -DLLVM_ENABLE_MLIR_ISEL=ON.
+  InitializeMLIRISel();
+#endif
 
   // Initialize codegen and IR passes used by llc so that the -print-after,
   // -print-before, and -stop-after options work.
