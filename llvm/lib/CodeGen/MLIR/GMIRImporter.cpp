@@ -9,6 +9,7 @@
 #include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "mlir/IR/Builders.h"
@@ -18,19 +19,69 @@ using namespace mlir;
 
 namespace {
 
-/// Converts a scalar integer llvm::Type to !gmir.llt. Returns a null type
-/// for anything else (vectors, pointers, floats, aggregates) -- all out of
-/// scope for M1/M2. Note: both `Value` and `Type` name distinct classes in
-/// ::llvm and ::mlir, so this file explicitly qualifies mlir::Value/
-/// mlir::Type/mlir::FunctionType throughout to avoid ambiguous lookups
-/// under the blanket `using namespace llvm;`/`using namespace mlir;` below.
+/// Converts a scalar integer or pointer llvm::Type to !gmir.llt. Returns a
+/// null type for anything else (vectors, floats, aggregates) -- aggregates
+/// are handled by flattening to multiple leaf !gmir.llt values (see
+/// computeGMIRLeafTypes), not by this function; vectors/floats remain out
+/// of scope. Note: both `Value` and `Type` name distinct classes in ::llvm
+/// and ::mlir, so this file explicitly qualifies mlir::Value/mlir::Type/
+/// mlir::FunctionType throughout to avoid ambiguous lookups under the
+/// blanket `using namespace llvm;`/`using namespace mlir;` below.
 gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
-  auto *IntTy = dyn_cast<llvm::IntegerType>(Ty);
-  if (!IntTy)
-    return {};
-  return gmir::LLTType::get(&Context, IntTy->getBitWidth(),
-                             /*numElements=*/0, /*addressSpace=*/0,
-                             /*isScalable=*/false);
+  if (auto *IntTy = dyn_cast<llvm::IntegerType>(Ty))
+    return gmir::LLTType::get(&Context, IntTy->getBitWidth(),
+                               /*numElements=*/0, /*addressSpace=*/0,
+                               /*isScalable=*/false);
+  if (auto *PtrTy = dyn_cast<llvm::PointerType>(Ty))
+    return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
+                               /*numElements=*/0, PtrTy->getAddressSpace(),
+                               /*isScalable=*/false);
+  return {};
+}
+
+/// Recursively flattens an (possibly aggregate) llvm::Type into its leaf
+/// scalar/pointer !gmir.llt types plus each leaf's byte offset within Ty,
+/// mirroring llvm::ComputeValueTypes (Analysis.cpp) -- struct fields via
+/// DataLayout::getStructLayout(), array elements via `i * EltSize`. Every
+/// SSA value in the importer is conceptually backed by a list of leaf
+/// mlir::Values (see FunctionImporter::ValueMap), the same way IRTranslator
+/// backs every llvm::Value with ArrayRef<Register> rather than Register --
+/// LLT (and so !gmir.llt) has no aggregate representation, only
+/// scalar/vector/pointer. Void produces zero leaves. Returns false (leaving
+/// Types/Offsets in a possibly-partial state) if any leaf isn't a supported
+/// scalar/pointer type.
+bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
+                           llvm::Type *Ty, SmallVectorImpl<gmir::LLTType> &Types,
+                           SmallVectorImpl<uint64_t> &Offsets,
+                           uint64_t StartOffset = 0) {
+  if (Ty->isVoidTy())
+    return true;
+  if (auto *StTy = dyn_cast<llvm::StructType>(Ty)) {
+    const StructLayout *SL = DL.getStructLayout(StTy);
+    for (unsigned I = 0, E = StTy->getNumElements(); I != E; ++I) {
+      if (!computeGMIRLeafTypes(Context, DL, StTy->getElementType(I), Types,
+                                 Offsets,
+                                 StartOffset + SL->getElementOffset(I)))
+        return false;
+    }
+    return true;
+  }
+  if (auto *ArrTy = dyn_cast<llvm::ArrayType>(Ty)) {
+    llvm::Type *ElemTy = ArrTy->getElementType();
+    uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
+    for (uint64_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
+      if (!computeGMIRLeafTypes(Context, DL, ElemTy, Types, Offsets,
+                                 StartOffset + I * ElemSize))
+        return false;
+    }
+    return true;
+  }
+  gmir::LLTType LeafTy = convertType(Context, Ty);
+  if (!LeafTy)
+    return false;
+  Types.push_back(LeafTy);
+  Offsets.push_back(StartOffset);
+  return true;
 }
 
 /// Walks an llvm::Function's basic blocks, building `gmir` ops. Bails out
@@ -50,6 +101,7 @@ public:
 
   /// Returns false the moment an unsupported construct is seen.
   bool import(Function &F, func::FuncOp FuncOp) {
+    DL = &F.getParent()->getDataLayout();
     unsigned ArgIdx = 0;
     for (Argument &Arg : F.args())
       ValueMap[&Arg] = FuncOp.getArgument(ArgIdx++);
@@ -115,8 +167,28 @@ private:
           return false;
         continue;
       }
-      // Anything else (calls, loads/stores, switches, casts, ...) is out
-      // of scope for M1/M2 -- fall back rather than mistranslate.
+      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+        if (!importAlloca(*AI))
+          return false;
+        continue;
+      }
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (!importLoad(*LI))
+          return false;
+        continue;
+      }
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (!importStore(*SI))
+          return false;
+        continue;
+      }
+      // Anything else (calls, GEPs, switches, casts, selects, ...) is out
+      // of scope for this milestone slice -- fall back rather than
+      // mistranslate. Note: `select` and `switch` are reachable even from
+      // simple hand-written diamond/chained-if IR, since llc's own IR-level
+      // pipeline (CodeGenPrepare/SimplifyCFG-style passes) canonicalizes
+      // some diamond phi patterns into `select` and some icmp-chains into
+      // `switch` before codegen ever sees the function.
       return false;
     }
     // Fell off the end without a terminator: malformed IR, shouldn't
@@ -178,6 +250,68 @@ private:
         Builder.getI64IntegerAttr(static_cast<int64_t>(ICmp.getPredicate())),
         LHS, RHS);
     ValueMap[&ICmp] = Op.getResult();
+    return true;
+  }
+
+  /// Static-only (§1.5 of the design doc): dynamic-sized or non-entry-block
+  /// allocas fall back to the legacy selector rather than being modeled.
+  bool importAlloca(AllocaInst &AI) {
+    if (!AI.isStaticAlloca())
+      return false;
+    gmir::LLTType ResTy = convertType(Context, AI.getType());
+    if (!ResTy)
+      return false;
+    // Matches IRTranslator::getOrCreateFrameIndex: always allocate at least
+    // one byte.
+    TypeSize Size = AI.getAllocationSize(*DL).value_or(TypeSize::getZero());
+    uint64_t SizeBytes = std::max<uint64_t>(Size.getKnownMinValue(), 1);
+    auto Op = gmir::AllocaOp::create(
+        Builder, Builder.getUnknownLoc(), ResTy,
+        Builder.getI64IntegerAttr(SizeBytes),
+        Builder.getI64IntegerAttr(AI.getAlign().value()));
+    ValueMap[&AI] = Op.getResult();
+    return true;
+  }
+
+  /// Scalar/pointer only for now -- an aggregate-typed load bails here
+  /// (leaf count != 1); aggregate flattening is added on top of this same
+  /// helper in a later milestone slice.
+  bool importLoad(LoadInst &LI) {
+    SmallVector<gmir::LLTType, 1> LeafTypes;
+    SmallVector<uint64_t, 1> Offsets;
+    if (!computeGMIRLeafTypes(Context, *DL, LI.getType(), LeafTypes, Offsets) ||
+        LeafTypes.size() != 1)
+      return false;
+    mlir::Value Ptr;
+    if (!getOperand(LI.getPointerOperand(), Ptr))
+      return false;
+    auto Op = gmir::LoadOp::create(
+        Builder, Builder.getUnknownLoc(), LeafTypes[0], Ptr,
+        Builder.getI64IntegerAttr(LI.getAlign().value()),
+        Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getOrdering())),
+        Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getSyncScopeID())),
+        LI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr());
+    ValueMap[&LI] = Op.getResult();
+    return true;
+  }
+
+  bool importStore(StoreInst &SI) {
+    SmallVector<gmir::LLTType, 1> LeafTypes;
+    SmallVector<uint64_t, 1> Offsets;
+    if (!computeGMIRLeafTypes(Context, *DL, SI.getValueOperand()->getType(),
+                               LeafTypes, Offsets) ||
+        LeafTypes.size() != 1)
+      return false;
+    mlir::Value Val, Ptr;
+    if (!getOperand(SI.getValueOperand(), Val) ||
+        !getOperand(SI.getPointerOperand(), Ptr))
+      return false;
+    gmir::StoreOp::create(
+        Builder, Builder.getUnknownLoc(), Val, Ptr,
+        Builder.getI64IntegerAttr(SI.getAlign().value()),
+        Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getOrdering())),
+        Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
+        SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr());
     return true;
   }
 
@@ -260,6 +394,7 @@ private:
 
   MLIRContext &Context;
   OpBuilder Builder;
+  const llvm::DataLayout *DL = nullptr;
   llvm::DenseMap<BasicBlock *, Block *> BlockMap;
   llvm::DenseMap<llvm::Value *, mlir::Value> ValueMap;
 };

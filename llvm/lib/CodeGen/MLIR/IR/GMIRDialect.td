@@ -8,9 +8,8 @@
 //
 // This file declares the `gmir` dialect: an MLIR mirror of GlobalISel's
 // generic MIR, used as the target of the experimental MLIR-based
-// instruction-selection pipeline. Ops are limited to what M1's
-// straight-line scalar-arithmetic slice needs; see
-// ~/llvm/mlir_instruction_selection_plan.md for the roadmap.
+// instruction-selection pipeline. Ops grow incrementally, milestone by
+// milestone; see ~/llvm/mlir_instruction_selection_plan.md for the roadmap.
 //
 //===----------------------------------------------------------------------===//
 
@@ -125,6 +124,54 @@ def GMIR_CondBrOp : GMIR_Op<"brcond", [Pure, Terminator, AttrSizedOperandSegment
                        Variadic<GMIR_LLTType>:$trueDestOperands,
                        Variadic<GMIR_LLTType>:$falseDestOperands);
   let successors = (successor AnySuccessor:$trueDest, AnySuccessor:$falseDest);
+}
+
+def GMIR_AllocaOp : GMIR_Op<"alloca"> {
+  let summary = "Static stack allocation, mirroring G_FRAME_INDEX";
+  let description = [{
+    Static-only: constant size, entry-block placement in the original IR
+    (`llvm::AllocaInst::isStaticAlloca()`). Dynamic-sized or non-entry-block
+    allocas fall back to the legacy selector rather than being modeled here.
+    Deliberately named without a "static_" prefix so a future
+    `gmir.dyn_alloca` (mirroring `G_DYN_STACKALLOC`) reads as a natural
+    sibling op rather than a retrofit -- matches how GlobalISel itself keeps
+    these as two separate opcodes rather than one polymorphic one.
+  }];
+  let arguments = (ins I64Attr:$size, I64Attr:$align);
+  let results = (outs GMIR_LLTType:$res); // always a pointer LLT
+}
+
+def GMIR_LoadOp : GMIR_Op<"load",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Load from memory, mirroring GlobalISel's G_LOAD";
+  let description = [{
+    `ordering`/`syncscope` hold the raw `llvm::AtomicOrdering`/
+    `SyncScope::ID` integer values (0 = NotAtomic / System) -- a plain
+    attribute rather than a new MLIR enum-attr, matching `gmir.icmp`'s
+    predicate. Carried from day one rather than added only once atomics are
+    needed: `MachineMemOperand`'s constructor threads ordering/syncscope in
+    alongside size/alignment, so adding them to this op later would be a
+    breaking shape change, not an additive one. For a struct/array-typed
+    load, the importer emits one `gmir.load` per flattened scalar/pointer
+    leaf (each with its own already-resolved offset pointer and alignment)
+    rather than a single multi-result op -- mirrors IRTranslator's
+    multi-register loop, not a new gmir-level aggregate concept.
+  }];
+  let arguments = (ins GMIR_LLTType:$ptr, I64Attr:$align, I64Attr:$ordering,
+                       I64Attr:$syncscope, UnitAttr:$isVolatile);
+  let results = (outs GMIR_LLTType:$res);
+}
+
+def GMIR_StoreOp : GMIR_Op<"store",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Store to memory, mirroring GlobalISel's G_STORE";
+  let description = [{
+    See `gmir.load` for the `ordering`/`syncscope` attribute convention and
+    the "one op per flattened leaf" aggregate-decomposition approach.
+  }];
+  let arguments = (ins GMIR_LLTType:$value, GMIR_LLTType:$ptr, I64Attr:$align,
+                       I64Attr:$ordering, I64Attr:$syncscope,
+                       UnitAttr:$isVolatile);
 }
 
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD

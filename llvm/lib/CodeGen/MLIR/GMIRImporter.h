@@ -25,11 +25,11 @@ class Function;
 
 namespace gmir {
 
-/// Imports F's single basic block into a new mlir::func::FuncOp appended to
-/// Module, as `gmir` ops. Returns a null FuncOp -- without building
-/// anything further -- the moment F contains anything outside the M1
-/// supported subset: more than one basic block, a non-integer/vector type,
-/// or an instruction opcode other than add/sub/mul/sdiv/and/or/xor/ret.
+/// Imports F into a new mlir::func::FuncOp appended to Module, as `gmir`
+/// ops. Returns a null FuncOp -- without building anything further -- the
+/// moment F contains anything outside the currently-supported subset (see
+/// GMIRImporter.cpp's per-instruction dispatch for the exact list; grows
+/// milestone by milestone, see ~/llvm/mlir_instruction_selection_plan.md).
 mlir::func::FuncOp importFunction(mlir::ModuleOp Module, llvm::Function &F);
 
 } // namespace gmir

@@ -59,6 +59,39 @@ Block *CondBrOp::getSuccessorForOperands(ArrayRef<mlir::Attribute> operands) {
   return nullptr;
 }
 
+// MemoryEffectsOpInterface methods for GMIR_LoadOp/GMIR_StoreOp -- ODS only
+// declares these (DeclareOpInterfaceMethods), same reason as BranchOpInterface
+// above. Mirrors mlir::LLVM::LoadOp/StoreOp::getEffects exactly
+// (mlir/lib/Dialect/LLVMIR/IR/LLVMDialect.cpp:839-853,918-932): a plain
+// Read/Write on the pointer operand, plus a conservative extra Read+Write
+// pair when the access is volatile or "stronger than unordered" atomic,
+// since such accesses can have target-specific effects beyond the single
+// pointed-to location.
+// mlir::MemoryEffects/mlir::SideEffects collide with llvm::MemoryEffects
+// (IR-level function/call memory-effect attributes) under this file's
+// blanket `using namespace mlir;` + the ambient `using namespace llvm;` --
+// same class of ambiguity as Value/Type/Attribute/DataLayout above,
+// explicitly qualified for the same reason.
+void LoadOp::getEffects(
+    SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Read::get(), &getPtrMutable());
+  if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
+    effects.emplace_back(mlir::MemoryEffects::Write::get());
+    effects.emplace_back(mlir::MemoryEffects::Read::get());
+  }
+}
+
+void StoreOp::getEffects(
+    SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Write::get(), &getPtrMutable());
+  if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
+    effects.emplace_back(mlir::MemoryEffects::Write::get());
+    effects.emplace_back(mlir::MemoryEffects::Read::get());
+  }
+}
+
 void GMIRDialect::initialize() {
   addTypes<
 #define GET_TYPEDEF_LIST
