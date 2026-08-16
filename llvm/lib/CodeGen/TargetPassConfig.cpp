@@ -25,8 +25,10 @@
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachinePassRegistry.h"
+#include "llvm/CodeGen/MLIRISel.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegAllocRegistry.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/PassInstrumentation.h"
@@ -170,6 +172,13 @@ EnableFastISelOption("fast-isel", cl::Hidden,
 static cl::opt<cl::boolOrDefault> EnableGlobalISelOption(
     "global-isel", cl::Hidden,
     cl::desc("Enable the \"global\" instruction selector"));
+
+// Experimental: select via the MLIR-based pipeline (llvm/lib/CodeGen/MLIR/).
+// Always accepted, even in builds without MLIR ISel support, in which case
+// it silently falls back (see the SelectorType::MLIRISel handling below).
+static cl::opt<bool> EnableMLIRISel(
+    "enable-mlir-isel", cl::Hidden,
+    cl::desc("Enable the experimental MLIR-based instruction selector"));
 
 // FIXME: remove this after switching to NPM or GlobalISel, whichever gets there
 //        first...
@@ -997,10 +1006,12 @@ bool TargetPassConfig::addCoreISelPasses() {
   TM->setO0WantsFastISel(EnableFastISelOption != cl::boolOrDefault::BOU_FALSE);
 
   // Determine an instruction selector.
-  enum class SelectorType { SelectionDAG, FastISel, GlobalISel };
+  enum class SelectorType { SelectionDAG, FastISel, GlobalISel, MLIRISel };
   SelectorType Selector;
 
-  if (EnableFastISelOption == cl::boolOrDefault::BOU_TRUE)
+  if (EnableMLIRISel)
+    Selector = SelectorType::MLIRISel;
+  else if (EnableFastISelOption == cl::boolOrDefault::BOU_TRUE)
     Selector = SelectorType::FastISel;
   else if (EnableGlobalISelOption == cl::boolOrDefault::BOU_TRUE ||
            (TM->Options.EnableGlobalISel &&
@@ -1058,11 +1069,38 @@ bool TargetPassConfig::addCoreISelPasses() {
       return true;
   }
 
+  // Add the instruction selector pass for the experimental MLIR-based
+  // pipeline if enabled. createMLIRInstructionSelectPass() returns nullptr
+  // in builds without MLIR ISel support, in which case we just skip adding
+  // any pass here and fall through to SelectionDAG below, same as if
+  // -enable-mlir-isel had never been passed.
+  if (Selector == SelectorType::MLIRISel) {
+    SaveAndRestore SavedAddingMachinePasses(AddingMachinePasses, true);
+    if (MachineFunctionPass *MLIRISel = createMLIRInstructionSelectPass())
+      addPass(MLIRISel);
+    else
+      WithColor::warning()
+          << "-enable-mlir-isel was passed, but this build wasn't "
+             "configured with -DLLVM_ENABLE_MLIR_ISEL=ON; falling back to "
+             "the normal instruction selector.\n";
+  }
+
   // Pass to reset the MachineFunction if the ISel failed. Outside of the above
-  // if so that the verifier is not added to it.
+  // if so that the verifier is not added to it. GlobalISel and MLIRISel both
+  // may leave partially-built MIR behind on failure that needs to be wiped
+  // before SelectionDAG runs on a clean MachineFunction, but each selector
+  // controls its own abort-vs-fallback behavior independently: reusing
+  // isGlobalISelAbortEnabled() for MLIRISel would inherit
+  // TargetOptions::GlobalISelAbort's default of Enable (abort), causing
+  // -enable-mlir-isel to hard-abort via report_fatal_error instead of
+  // falling back -- MLIRISel has no abort-mode flag yet (decision #6 only
+  // calls for graceful fallback), so it always resets rather than aborting.
   if (Selector == SelectorType::GlobalISel)
     addPass(createResetMachineFunctionPass(
         reportDiagnosticWhenGlobalISelFallback(), isGlobalISelAbortEnabled()));
+  else if (Selector == SelectorType::MLIRISel)
+    addPass(createResetMachineFunctionPass(/*EmitFallbackDiag=*/false,
+                                            /*AbortOnFailedISel=*/false));
 
   // Run the SDAG InstSelector, providing a fallback path when we do not want to
   // abort on not-yet-supported input.
