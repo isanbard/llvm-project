@@ -93,7 +93,8 @@ public:
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
     mlir::func::FuncOp FuncOp =
         gmir::importFunction(*Module, MF.getFunction());
-    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF)) {
+    const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
+    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI)) {
       // Outside M1's supported subset, or CallLowering itself declined:
       // defer to the existing selector, same as always.
       MF.getProperties().setFailedISel();

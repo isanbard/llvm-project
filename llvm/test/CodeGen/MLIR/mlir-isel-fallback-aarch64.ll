@@ -15,3 +15,17 @@ define i32 @calls_something(i32 %a) {
   %r = call i32 @callee(i32 %a)
   ret i32 %r
 }
+
+define i32 @switcher(i32 %x) {
+entry:
+  switch i32 %x, label %default [
+    i32 0, label %case0
+    i32 1, label %case1
+  ]
+case0:
+  ret i32 10
+case1:
+  ret i32 20
+default:
+  ret i32 30
+}
