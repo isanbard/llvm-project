@@ -11,6 +11,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Location.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/CodeGen/Analysis.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -62,55 +63,42 @@ gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
   return {};
 }
 
-/// Recursively flattens an (possibly aggregate) llvm::Type into its leaf
-/// scalar/pointer !gmir.llt types plus each leaf's byte offset within Ty,
-/// mirroring llvm::ComputeValueTypes (Analysis.cpp) -- struct fields via
-/// DataLayout::getStructLayout(), array elements via `i * EltSize`. Every
-/// SSA value in the importer is conceptually backed by a list of leaf
-/// mlir::Values (see FunctionImporter::ValueMap), the same way IRTranslator
-/// backs every llvm::Value with ArrayRef<Register> rather than Register --
-/// LLT (and so !gmir.llt) has no aggregate representation, only
-/// scalar/vector/pointer. Void produces zero leaves. Returns false (leaving
-/// Types/Offsets in a possibly-partial state) if any leaf isn't a supported
-/// scalar/pointer type.
+/// Flattens an (possibly aggregate) llvm::Type into its leaf scalar/pointer
+/// !gmir.llt types plus each leaf's byte offset within Ty. Every SSA value
+/// in the importer is conceptually backed by a list of leaf mlir::Values
+/// (see FunctionImporter::ValueMap), the same way IRTranslator backs every
+/// llvm::Value with ArrayRef<Register> rather than Register -- LLT (and so
+/// !gmir.llt) has no aggregate representation, only scalar/vector/pointer.
+/// Void produces zero leaves. Returns false (leaving Types/Offsets in a
+/// possibly-partial state) if any leaf isn't a supported scalar/pointer
+/// type, or if any leaf's offset is scalable (!gmir.llt/gmir ops have no
+/// way to represent a vscale-dependent byte offset).
+///
+/// The actual struct/array recursion is llvm::ComputeValueTypes
+/// (llvm/CodeGen/Analysis.h) -- the same representation-agnostic walker
+/// IRTranslator's own computeValueLLTs is a thin wrapper over (see
+/// Analysis.cpp: computeValueLLTs just maps ComputeValueTypes's leaf
+/// llvm::Types through getLLTForType; this does the same through
+/// convertType instead). Reusing it directly, rather than hand-porting the
+/// struct/array walk again, means any future correctness fix to it (e.g.
+/// around scalable-type handling, which it already supports more
+/// completely than an earlier version of this function did -- see the
+/// design doc) benefits every caller without a separate re-port.
 bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
                           llvm::Type *Ty, SmallVectorImpl<gmir::LLTType> &Types,
-                          SmallVectorImpl<uint64_t> &Offsets,
-                          uint64_t StartOffset = 0) {
-  if (Ty->isVoidTy())
-    return true;
-  if (auto *StTy = dyn_cast<llvm::StructType>(Ty)) {
-    const StructLayout *SL = DL.getStructLayout(StTy);
-    for (unsigned I = 0, E = StTy->getNumElements(); I != E; ++I) {
-      if (!computeGMIRLeafTypes(Context, DL, StTy->getElementType(I), Types,
-                                Offsets, StartOffset + SL->getElementOffset(I)))
-        return false;
-    }
-    return true;
-  }
-  if (auto *ArrTy = dyn_cast<llvm::ArrayType>(Ty)) {
-    llvm::Type *ElemTy = ArrTy->getElementType();
-    // getTypeAllocSize returns a TypeSize, not a plain integer: for a
-    // scalable element type its implicit conversion to uint64_t below
-    // would call reportFatalInternalError and abort the whole compiler,
-    // not fail gracefully like every other unsupported-type path in this
-    // function. Bail explicitly instead.
-    TypeSize ElemSizeTS = DL.getTypeAllocSize(ElemTy);
-    if (ElemSizeTS.isScalable())
+                          SmallVectorImpl<uint64_t> &Offsets) {
+  SmallVector<llvm::Type *, 1> LeafIRTypes;
+  SmallVector<TypeSize, 1> LeafOffsets;
+  llvm::ComputeValueTypes(DL, Ty, LeafIRTypes, &LeafOffsets);
+  for (auto [LeafIRTy, LeafOffset] : zip(LeafIRTypes, LeafOffsets)) {
+    if (LeafOffset.isScalable())
       return false;
-    uint64_t ElemSize = ElemSizeTS.getFixedValue();
-    for (uint64_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
-      if (!computeGMIRLeafTypes(Context, DL, ElemTy, Types, Offsets,
-                                StartOffset + I * ElemSize))
-        return false;
-    }
-    return true;
+    gmir::LLTType LeafTy = convertType(Context, LeafIRTy);
+    if (!LeafTy)
+      return false;
+    Types.push_back(LeafTy);
+    Offsets.push_back(LeafOffset.getFixedValue());
   }
-  gmir::LLTType LeafTy = convertType(Context, Ty);
-  if (!LeafTy)
-    return false;
-  Types.push_back(LeafTy);
-  Offsets.push_back(StartOffset);
   return true;
 }
 
@@ -458,6 +446,24 @@ private:
   /// whose integer bit width doesn't match the pointer-index type's
   /// width, since gmir has no sext/trunc op yet to fix that up (see
   /// gmir.ptr_add's doc comment).
+  ///
+  /// Unlike computeGMIRLeafTypes (which now delegates its struct/array
+  /// walk to the shared llvm::ComputeValueTypes), this function's
+  /// coalescing loop is a genuine hand-port rather than a call into
+  /// IRTranslator::translateGetElementPtr, and deliberately stays that
+  /// way: the type-system primitives it walks (gep_type_iterator,
+  /// DataLayout::getStructLayout) are already shared as-is, but the
+  /// coalescing *algorithm* itself is entangled with MachineIRBuilder's
+  /// G_PTR_ADD/G_MUL/G_CONSTANT builder calls in the real function, with
+  /// no existing builder-agnostic abstraction to call into instead.
+  /// Extracting one would mean refactoring a core, heavily-used
+  /// GlobalISel function used by every in-tree target to be templated or
+  /// callback-parameterized over "how do I emit an add/mul/constant" --
+  /// a meaningfully larger and riskier change than a mechanical
+  /// extraction (contrast createMIRBuilder in GlobalISel/Utils.cpp, a
+  /// true behavior-preserving extraction with no design decisions),
+  /// for a ~50-line algorithm that changes rarely. Not attempted here;
+  /// worth reconsidering if it ever proves to actually drift.
   bool importGEP(GetElementPtrInst &GEP) {
     // llvm::VectorType vs. mlir::VectorType collide under this file's
     // blanket `using namespace llvm;`/`using namespace mlir;` -- same
