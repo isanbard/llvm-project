@@ -9,14 +9,19 @@
 #include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GlobalAlias.h"
+#include "llvm/IR/GlobalIFunc.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Alignment.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Location.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -191,7 +196,12 @@ private:
           return false;
         continue;
       }
-      // Anything else (calls, switches, casts, selects, ...) is out of
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (!importCall(*CI))
+          return false;
+        continue;
+      }
+      // Anything else (switches, casts, selects, invokes, ...) is out of
       // scope for this milestone slice -- fall back rather than
       // mistranslate. Note: `select` and `switch` are reachable even from
       // simple hand-written diamond/chained-if IR, since llc's own IR-level
@@ -491,6 +501,79 @@ private:
       EmitConstOffset(Offset);
 
     ValueMap[&GEP] = {BaseVal};
+    return true;
+  }
+
+  /// Imports a direct, non-vararg, non-tail/musttail CallInst with no
+  /// byval/sret/inalloca/preallocated/byref/swifterror/swiftself/
+  /// swiftasync parameter attributes, no operand bundles, that isn't an
+  /// intrinsic or inline-asm call, and whose return type is void or
+  /// convertType-representable (aggregate returns needing sret-demotion
+  /// are conservatively out of scope for this milestone slice -- see
+  /// GMIRDialect.td's gmir.call doc comment). Arguments flatten via
+  /// computeGMIRLeafTypes/getOperands, the same mechanism as aggregate
+  /// load/store. Sets the op's location to an mlir::OpaqueLoc wrapping
+  /// &CI, the only way MLIRToGMIRTranslator can recover the original
+  /// llvm::CallInst it needs for CallLowering::lowerCall's CallBase-taking
+  /// overload -- see GMIRDialect.td's gmir.call doc comment for why that
+  /// overload is used instead of hand-building a CallLoweringInfo.
+  bool importCall(CallInst &CI) {
+    if (CI.isInlineAsm() || CI.isTailCall() || CI.isMustTailCall() ||
+        CI.hasOperandBundles() || CI.getFunctionType()->isVarArg())
+      return false;
+
+    llvm::Value *CalleeV = CI.getCalledOperand()->stripPointerCasts();
+    if (!isa<Function, GlobalIFunc, GlobalAlias>(CalleeV))
+      return false; // indirect call
+    if (auto *F = dyn_cast<Function>(CalleeV))
+      if (F->getIntrinsicID() != Intrinsic::not_intrinsic)
+        return false;
+
+    // llvm::Attribute vs. mlir::Attribute collide under this file's
+    // blanket `using namespace llvm;`/`using namespace mlir;` -- same
+    // class of ambiguity as VectorType/Value/Type/DenseMap noted
+    // elsewhere in this codebase; explicit `llvm::` qualification
+    // required.
+    static constexpr llvm::Attribute::AttrKind BannedParamAttrs[] = {
+        llvm::Attribute::ByVal,        llvm::Attribute::StructRet,
+        llvm::Attribute::InAlloca,     llvm::Attribute::Preallocated,
+        llvm::Attribute::ByRef,        llvm::Attribute::SwiftError,
+        llvm::Attribute::SwiftSelf,    llvm::Attribute::SwiftAsync};
+    for (unsigned I = 0, E = CI.arg_size(); I != E; ++I)
+      for (llvm::Attribute::AttrKind Kind : BannedParamAttrs)
+        if (CI.paramHasAttr(I, Kind))
+          return false;
+
+    gmir::LLTType RetTy;
+    if (!CI.getType()->isVoidTy()) {
+      RetTy = convertType(Context, CI.getType());
+      if (!RetTy)
+        return false; // aggregate/vector/float return: out of scope
+    }
+
+    SmallVector<mlir::Value, 8> FlatArgs;
+    SmallVector<int32_t, 8> LeafCounts;
+    for (llvm::Value *Arg : CI.args()) {
+      SmallVector<gmir::LLTType, 1> LeafTypes;
+      SmallVector<uint64_t, 1> Offsets;
+      if (!computeGMIRLeafTypes(Context, *DL, Arg->getType(), LeafTypes,
+                                 Offsets))
+        return false;
+      SmallVector<mlir::Value, 1> ArgLeaves;
+      if (!getOperands(Arg, ArgLeaves) || ArgLeaves.size() != LeafTypes.size())
+        return false;
+      LeafCounts.push_back(static_cast<int32_t>(ArgLeaves.size()));
+      FlatArgs.append(ArgLeaves.begin(), ArgLeaves.end());
+    }
+
+    mlir::Location Loc = mlir::OpaqueLoc::get<llvm::CallInst *>(&CI, &Context);
+    auto Op = gmir::CallOp::create(
+        Builder, Loc, RetTy ? mlir::TypeRange(RetTy) : mlir::TypeRange(),
+        mlir::FlatSymbolRefAttr::get(&Context, cast<GlobalValue>(CalleeV)->getName()),
+        Builder.getI64IntegerAttr(static_cast<int64_t>(CI.getCallingConv())),
+        FlatArgs, Builder.getDenseI32ArrayAttr(LeafCounts));
+    if (RetTy)
+      ValueMap[&CI] = {Op.getResult()};
     return true;
   }
 

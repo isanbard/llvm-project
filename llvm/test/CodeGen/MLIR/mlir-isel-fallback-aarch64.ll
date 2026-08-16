@@ -9,13 +9,6 @@
 ; scalar-arith-aarch64.ll, even though this particular test doesn't
 ; currently need a file-global feature requirement beyond the target).
 
-declare i32 @callee(i32)
-
-define i32 @calls_something(i32 %a) {
-  %r = call i32 @callee(i32 %a)
-  ret i32 %r
-}
-
 define i32 @switcher(i32 %x) {
 entry:
   switch i32 %x, label %default [
@@ -56,4 +49,18 @@ entry:
   %s = load {i32, float}, ptr %src
   store {i32, float} %s, ptr %dst
   ret void
+}
+
+define i32 @indirect_call(ptr %fp, i32 %a) {
+entry:
+  %r = call i32 %fp(i32 %a)
+  ret i32 %r
+}
+
+declare i32 @vararg_callee(i32, ...)
+
+define i32 @vararg_call(i32 %a, i32 %b) {
+entry:
+  %r = call i32 (i32, ...) @vararg_callee(i32 %a, i32 %b)
+  ret i32 %r
 }

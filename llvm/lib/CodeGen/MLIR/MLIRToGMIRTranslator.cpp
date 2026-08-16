@@ -20,6 +20,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "mlir/IR/Location.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -327,9 +328,66 @@ private:
       return true;
     }
 
+    if (auto Call = dyn_cast<gmir::CallOp>(&Op))
+      return translateCall(Call);
+
     // GMIRImporter only ever emits the ops handled above (plus
     // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
     return false;
+  }
+
+  /// Translates gmir.call by recovering the original llvm::CallInst via
+  /// this op's mlir::OpaqueLoc location (set at import time -- see
+  /// GMIRImporter.cpp's importCall) and calling CallLowering::lowerCall's
+  /// CallBase-taking overload directly on it, rather than hand-building a
+  /// CallLoweringInfo -- see GMIRDialect.td's gmir.call doc comment for
+  /// why: that overload already derives argument flags from IR
+  /// Attributes, recomputes tail-call eligibility, and handles
+  /// sret-demotion, all logic worth reusing rather than duplicating. The
+  /// zero/nullopt/unreachable arguments below are each provably unused
+  /// given importCall's bail-out list: no swifterror, no ptrauth bundle,
+  /// no convergencectrl bundle, and the callee is always direct (so
+  /// GetCalleeReg is never actually invoked).
+  bool translateCall(gmir::CallOp Call) {
+    auto *CI = mlir::OpaqueLoc::getUnderlyingLocationOrNull<llvm::CallInst *>(
+        Call.getLoc());
+    assert(CI && "gmir.call must carry its originating llvm::CallInst via "
+                 "OpaqueLoc -- see GMIRImporter.cpp's importCall");
+
+    SmallVector<Register, 1> ResRegs;
+    if (Call.getNumResults() == 1) {
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Call.getResult().getType()), DL);
+      ResRegs.push_back(MIRBuilder.getMRI()->createGenericVirtualRegister(Ty));
+    }
+
+    // Regroup the flat leaf-operand list back into one ArrayRef<Register>
+    // per original IR argument, using argLeafCounts. CallArgRegStorage
+    // provides stable storage for the ArrayRef<Register>s in ArgRegs,
+    // matching lowerFormalArguments's ArgRegStorage pattern.
+    SmallVector<SmallVector<Register, 1>, 8> CallArgRegStorage;
+    SmallVector<ArrayRef<Register>, 8> ArgRegs;
+    SmallVector<mlir::Value, 8> Args(Call.getArgs());
+    unsigned FlatIdx = 0;
+    for (int32_t Count : Call.getArgLeafCounts()) {
+      SmallVector<Register, 1> Regs;
+      for (int32_t I = 0; I != Count; ++I)
+        Regs.push_back(ValueToReg.lookup(Args[FlatIdx++]));
+      CallArgRegStorage.push_back(std::move(Regs));
+      ArgRegs.push_back(CallArgRegStorage.back());
+    }
+
+    if (!CLI.lowerCall(
+            MIRBuilder, *CI, ResRegs, ArgRegs, /*SwiftErrorVReg=*/Register(),
+            /*PAI=*/std::nullopt, /*ConvergenceCtrlToken=*/Register(),
+            /*GetCalleeReg=*/[]() -> Register {
+              llvm_unreachable("gmir.call is always a direct call in this "
+                               "subset -- see importCall's bail-out list");
+            }))
+      return false;
+
+    if (Call.getNumResults() == 1)
+      ValueToReg[Call.getResult()] = ResRegs[0];
+    return true;
   }
 
   /// Shared MMO construction for gmir.load/gmir.store. MachinePointerInfo

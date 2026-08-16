@@ -196,4 +196,39 @@ def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
   let results = (outs GMIR_LLTType:$res); // always a pointer LLT
 }
 
+def GMIR_CallOp : GMIR_Op<"call"> {
+  let summary = "Direct call, bridging to CallLowering::lowerCall";
+  let description = [{
+    Direct calls only (no indirect callee, no varargs, no tail/musttail, no
+    byval/sret/inalloca/preallocated/byref/swifterror/swiftself/swiftasync,
+    no operand bundles, not an intrinsic/inline-asm/GC statepoint call --
+    see GMIRImporter.cpp's importCall for the exact bail-out list).
+    `callee`/`callingConv` are descriptive attributes reconstructed from the
+    original llvm::CallBase at import time for self-description -- they are
+    NOT this op's translation source of truth. MLIRToGMIRTranslator instead
+    recovers the original llvm::CallInst* via this op's mlir::OpaqueLoc
+    location (set at import time; see importCall) and calls
+    CallLowering::lowerCall's CallBase-taking overload directly on it,
+    reusing its argument-flag derivation, tail-call-eligibility
+    recomputation, and sret-demotion logic wholesale rather than
+    re-deriving llvm::ISD::ArgFlagsTy bits by hand from IR Attributes -- see
+    MLIRToGMIRTranslator.cpp's translateCall for the full rationale.
+    `argLeafCounts[i]` gives the number of leaf `args` operands contributed
+    by original IR argument `i` (parallel to computeGMIRLeafTypes'
+    flattening of that argument's type), letting the translator regroup the
+    flat `args` operand list back into the ArrayRef<ArrayRef<Register>>
+    shape CallBase-based lowerCall's ArgRegs parameter expects.
+    Deliberately does NOT implement CallOpInterface/SymbolUserOpInterface:
+    `callee` generally does not name a sibling func.FuncOp in this module
+    (GMIRImporter only ever imports the one function currently being
+    compiled, never its callees), so treating it as a verifier-resolved
+    module symbol would be incorrect, unlike mlir::func::CallOp's usual
+    contract.
+  }];
+  let arguments = (ins FlatSymbolRefAttr:$callee, I64Attr:$callingConv,
+                       Variadic<GMIR_LLTType>:$args,
+                       DenseI32ArrayAttr:$argLeafCounts);
+  let results = (outs Optional<GMIR_LLTType>:$result);
+}
+
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD
