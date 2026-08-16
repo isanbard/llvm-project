@@ -85,6 +85,21 @@ entry:
   ret void
 }
 
+; Regression test: convertType (GMIRImporter.cpp) didn't cap integer bit
+; width, so an i128 (or wider) value with a small-magnitude constant
+; operand would slip past getOperands's "does the VALUE fit in 64
+; significant bits" check, get a >64-bit !gmir.llt, and crash in
+; MLIRToGMIRTranslator.cpp's gmir.constant handling (APInt::trunc()
+; asserts width <= BitWidth, and truncating a 64-bit attr up to a
+; 128-bit destination violates that). gmir.constant's own doc comment
+; already claimed ">64-bit constants are unsupported"; this makes that
+; actually true.
+define i128 @add_i128(i128 %a) {
+entry:
+  %r = add i128 %a, 5
+  ret i128 %r
+}
+
 define i32 @indirect_call(ptr %fp, i32 %a) {
 entry:
   %r = call i32 %fp(i32 %a)

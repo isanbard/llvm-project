@@ -65,3 +65,24 @@ join:
   %r = phi i32 [ %b, %case0 ], [ %c, %case1 ], [ %a, %default ]
   ret i32 %r
 }
+
+; See control-flow.ll's shared_constant_across_blocks for the full
+; rationale -- a regression test for a memoized-constant SSA-dominance bug
+; that was target-independent but only ever exercised on X86 before.
+define i32 @shared_constant_across_blocks(i32 %c, i32 %x) {
+entry:
+  %t = icmp eq i32 %c, 0
+  br i1 %t, label %then, label %else
+
+then:
+  %a = add i32 %x, 42
+  br label %join
+
+else:
+  %b = mul i32 %x, 42
+  br label %join
+
+join:
+  %r = phi i32 [ %a, %then ], [ %b, %else ]
+  ret i32 %r
+}

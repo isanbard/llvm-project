@@ -73,3 +73,34 @@ join:
   %r = phi i32 [ %b, %case0 ], [ %c, %case1 ], [ %a, %default ]
   ret i32 %r
 }
+
+; Regression test: both non-dominating arms reference the literal constant
+; 42. LLVM interns/uniques ConstantInts, so `then` and `else` share the
+; exact same llvm::Value* for it -- GMIRImporter.cpp's getOperands used to
+; memoize the gmir.constant it materializes for a ConstantInt keyed purely
+; by that shared llvm::Value*, at whichever block's insertion point
+; happened to be current the first time it was needed. Since `then` and
+; `else` here are siblings (neither dominates the other), reusing the
+; memoized value from one in the other produced an SSA value that didn't
+; dominate its use -- not caught until a downstream MachineFunction pass
+; (LiveVariables: "Can't find reaching def for virtreg"), well past
+; anything gmir/MLIR itself verifies. Fixed by always materializing
+; memoized constants at a fixed, dominates-everything cursor at the front
+; of the entry block, mirroring IRTranslator's own dedicated EntryBuilder.
+define i32 @shared_constant_across_blocks(i32 %c, i32 %x) {
+entry:
+  %t = icmp eq i32 %c, 0
+  br i1 %t, label %then, label %else
+
+then:
+  %a = add i32 %x, 42
+  br label %join
+
+else:
+  %b = mul i32 %x, 42
+  br label %join
+
+join:
+  %r = phi i32 [ %a, %then ], [ %b, %else ]
+  ret i32 %r
+}

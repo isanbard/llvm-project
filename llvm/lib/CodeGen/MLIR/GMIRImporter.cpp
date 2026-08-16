@@ -37,10 +37,23 @@ namespace {
 /// mlir::FunctionType throughout to avoid ambiguous lookups under the
 /// blanket `using namespace llvm;`/`using namespace mlir;` below.
 gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
-  if (auto *IntTy = dyn_cast<llvm::IntegerType>(Ty))
+  if (auto *IntTy = dyn_cast<llvm::IntegerType>(Ty)) {
+    // gmir.constant stores every value sign-extended into a 64-bit I64Attr
+    // (see its doc comment); a wider destination !gmir.llt would make
+    // MLIRToGMIRTranslator.cpp's later `.trunc(Ty.getScalarSizeInBits())`
+    // call truncate *up*, which APInt::trunc() forbids (width <=
+    // BitWidth) and asserts on. Reject integer types over 64 bits here,
+    // at the single shared type-conversion choke point, rather than only
+    // in the ConstantInt materialization path -- this also correctly
+    // rejects non-constant wide-integer values (e.g. two real i128
+    // arguments added together), which this milestone's pipeline has
+    // never validated either.
+    if (IntTy->getBitWidth() > 64)
+      return {};
     return gmir::LLTType::get(&Context, IntTy->getBitWidth(),
                               /*numElements=*/0, /*addressSpace=*/0,
                               /*isScalable=*/false);
+  }
   if (auto *PtrTy = dyn_cast<llvm::PointerType>(Ty))
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, PtrTy->getAddressSpace(),
@@ -76,7 +89,15 @@ bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
   }
   if (auto *ArrTy = dyn_cast<llvm::ArrayType>(Ty)) {
     llvm::Type *ElemTy = ArrTy->getElementType();
-    uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
+    // getTypeAllocSize returns a TypeSize, not a plain integer: for a
+    // scalable element type its implicit conversion to uint64_t below
+    // would call reportFatalInternalError and abort the whole compiler,
+    // not fail gracefully like every other unsupported-type path in this
+    // function. Bail explicitly instead.
+    TypeSize ElemSizeTS = DL.getTypeAllocSize(ElemTy);
+    if (ElemSizeTS.isScalable())
+      return false;
+    uint64_t ElemSize = ElemSizeTS.getFixedValue();
     for (uint64_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
       if (!computeGMIRLeafTypes(Context, DL, ElemTy, Types, Offsets,
                                 StartOffset + I * ElemSize))
@@ -110,6 +131,18 @@ public:
   /// Returns false the moment an unsupported construct is seen.
   bool import(Function &F, func::FuncOp FuncOp) {
     DL = &F.getParent()->getDataLayout();
+    // Memoized constants (see getOperands) are materialized at a fixed,
+    // growing-forward cursor at the very front of the entry block, exactly
+    // like IRTranslator's own dedicated EntryBuilder -- this guarantees
+    // any later reuse of a memoized constant's mlir::Value dominates its
+    // use, since the entry block dominates every other block and ops
+    // preceding all others in the entry block precede everything within
+    // it too. Without this, a ConstantInt shared by two non-dominating
+    // blocks (LLVM interns/uniques ConstantInts, so this is routine, not
+    // an edge case) would get memoized wherever it was first encountered
+    // and reused from a sibling block that doesn't dominate that point.
+    EntryBlock = &FuncOp.getBody().front();
+    ConstantInsertPt = EntryBlock->begin();
     unsigned ArgIdx = 0;
     for (Argument &Arg : F.args())
       ValueMap[&Arg] = {FuncOp.getArgument(ArgIdx++)};
@@ -275,6 +308,17 @@ private:
   /// allocas fall back to the legacy selector rather than being modeled.
   bool importAlloca(AllocaInst &AI) {
     if (!AI.isStaticAlloca())
+      return false;
+    // isStaticAlloca() only checks the array-size operand is a constant
+    // and the alloca is in the entry block -- it says nothing about
+    // whether the *allocated type itself* is scalable (e.g. `alloca
+    // <vscale x 4 x i32>` has no array-size operand at all, so it passes
+    // isStaticAlloca() cleanly). Reject that here explicitly: below,
+    // Size.getKnownMinValue() would silently return only the vscale=1
+    // size, understating the real (vscale-scaled) allocation and handing
+    // the translator a plain byte count with no way to say "and multiply
+    // by vscale" -- a silent under-sized stack object, not a crash.
+    if (AI.getAllocatedType()->isScalableTy())
       return false;
     gmir::LLTType ResTy = convertType(Context, AI.getType());
     if (!ResTy)
@@ -454,7 +498,15 @@ private:
         Offset += DL->getStructLayout(StTy)->getElementOffset(Field);
         continue;
       }
-      uint64_t ElementSize = GTI.getSequentialElementStride(*DL);
+      // getSequentialElementStride returns a TypeSize; a scalable stride
+      // (e.g. this step indexes into a <vscale x N x T> element) would
+      // fatally abort the compiler on the old implicit conversion to
+      // uint64_t below rather than falling back gracefully -- same class
+      // of gap as computeGMIRLeafTypes's array-element case.
+      TypeSize ElementSizeTS = GTI.getSequentialElementStride(*DL);
+      if (ElementSizeTS.isScalable())
+        return false;
+      uint64_t ElementSize = ElementSizeTS.getFixedValue();
       if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
         if (auto Val = CI->getValue().trySExtValue()) {
           Offset += ElementSize * *Val;
@@ -651,9 +703,16 @@ private:
     gmir::LLTType Ty = convertType(Context, CI->getType());
     if (!Ty)
       return false;
+    // Insert at the entry block's front-growing cursor, not wherever the
+    // caller's Builder happens to be pointed -- see import()'s comment on
+    // ConstantInsertPt for why: this constant may be memoized and reused
+    // from a block that doesn't dominate the current one.
+    mlir::OpBuilder::InsertionGuard Guard(Builder);
+    Builder.setInsertionPoint(EntryBlock, ConstantInsertPt);
     auto ConstOp = gmir::ConstantOp::create(
         Builder, Builder.getUnknownLoc(), Ty,
         Builder.getI64IntegerAttr(CI->getSExtValue()));
+    ConstantInsertPt = std::next(mlir::Block::iterator(ConstOp));
     ValueMap[V] = {ConstOp.getResult()};
     Out.push_back(ConstOp.getResult());
     return true;
@@ -676,6 +735,10 @@ private:
   MLIRContext &Context;
   OpBuilder Builder;
   const llvm::DataLayout *DL = nullptr;
+  /// Where the next memoized constant gets inserted -- see import()'s
+  /// comment and getOperands's use of these.
+  mlir::Block *EntryBlock = nullptr;
+  mlir::Block::iterator ConstantInsertPt;
   llvm::DenseMap<BasicBlock *, Block *> BlockMap;
   /// Every SSA value maps to a list of leaf mlir::Values -- almost always
   /// exactly one, except for an aggregate-typed load result or store

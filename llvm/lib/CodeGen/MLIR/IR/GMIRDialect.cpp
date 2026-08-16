@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/AtomicOrdering.h"
 
 using namespace mlir;
 using namespace llvm::gmir;
@@ -72,10 +73,23 @@ Block *CondBrOp::getSuccessorForOperands(ArrayRef<mlir::Attribute> operands) {
 // blanket `using namespace mlir;` + the ambient `using namespace llvm;` --
 // same class of ambiguity as Value/Type/Attribute/DataLayout above,
 // explicitly qualified for the same reason.
+// "Stronger than unordered": NotAtomic and Unordered both get no extra
+// effects, matching mlir::LLVM::LoadOp/StoreOp exactly -- the raw `!= 0`
+// check this used to be also flagged Unordered, contradicting this very
+// comment. Reuses llvm::isStrongerThanUnordered (AtomicOrdering.h) rather
+// than a hand-rolled `>` comparison: AtomicOrdering deliberately deletes
+// operator> (comparing orderings directly is a common source of bugs,
+// e.g. Acquire vs Release aren't ordered relative to each other even
+// though both are "stronger than Unordered").
+static bool isOrderingStrongerThanUnordered(mlir::IntegerAttr orderingAttr) {
+  return llvm::isStrongerThanUnordered(
+      static_cast<llvm::AtomicOrdering>(orderingAttr.getInt()));
+}
+
 void LoadOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
                             mlir::MemoryEffects::Effect>> &effects) {
   effects.emplace_back(mlir::MemoryEffects::Read::get(), &getPtrMutable());
-  if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
+  if (getIsVolatile() || isOrderingStrongerThanUnordered(getOrderingAttr())) {
     effects.emplace_back(mlir::MemoryEffects::Write::get());
     effects.emplace_back(mlir::MemoryEffects::Read::get());
   }
@@ -84,7 +98,7 @@ void LoadOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
 void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
                              mlir::MemoryEffects::Effect>> &effects) {
   effects.emplace_back(mlir::MemoryEffects::Write::get(), &getPtrMutable());
-  if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
+  if (getIsVolatile() || isOrderingStrongerThanUnordered(getOrderingAttr())) {
     effects.emplace_back(mlir::MemoryEffects::Write::get());
     effects.emplace_back(mlir::MemoryEffects::Read::get());
   }

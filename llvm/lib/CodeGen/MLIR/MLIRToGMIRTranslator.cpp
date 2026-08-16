@@ -398,7 +398,13 @@ private:
   /// empty -- a deliberate M3 scope exclusion (see design doc §1.5):
   /// unlike ordering (a correctness-affecting field once atomics are in
   /// play), AA metadata is a pure optimization hint, safe to omit, and not
-  /// carried through gmir today.
+  /// carried through gmir today. Same reasoning covers MOInvariant/
+  /// MODereferenceable/MONonTemporal (TargetLoweringBase::
+  /// getLoadMemOperandFlags/getStoreMemOperandFlags derive these from
+  /// !invariant.load/!nontemporal/etc IR metadata, which gmir.load/
+  /// gmir.store don't carry either) -- all pure codegen-quality hints,
+  /// never correctness, and out of scope until something actually needs
+  /// them.
   MachineMemOperand *buildMMO(MachineMemOperand::Flags BaseFlags, LLT Ty,
                               int64_t AlignBytes, int64_t OrderingVal,
                               int64_t SyncScopeVal, bool IsVolatile) {
