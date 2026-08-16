@@ -4252,16 +4252,15 @@ bool IRTranslator::runOnMachineFunction(MachineFunction &CurMF) {
   const TargetSubtargetInfo &Subtarget = MF->getSubtarget();
   TLI = Subtarget.getTargetLowering();
 
-  if (EnableCSE) {
-    EntryBuilder = std::make_unique<CSEMIRBuilder>(CurMF);
+  if (EnableCSE)
     CSEInfo = &Wrapper.get(TPC->getCSEConfig());
-    EntryBuilder->setCSEInfo(CSEInfo);
-    CurBuilder = std::make_unique<CSEMIRBuilder>(CurMF);
-    CurBuilder->setCSEInfo(CSEInfo);
-  } else {
-    EntryBuilder = std::make_unique<MachineIRBuilder>();
-    CurBuilder = std::make_unique<MachineIRBuilder>();
-  }
+  // createMIRBuilder is shared with the experimental MLIR-based ISel path
+  // (MLIRInstructionSelect.cpp), which needs the identical "CSEMIRBuilder
+  // wired to a shared CSEInfo, or a plain MachineIRBuilder" construction;
+  // the EnableCSE decision itself (including the -enable-cse-in-irtranslator
+  // override above) stays local to this function.
+  EntryBuilder = createMIRBuilder(CurMF, CSEInfo);
+  CurBuilder = createMIRBuilder(CurMF, CSEInfo);
   CLI = Subtarget.getCallLowering();
   CurBuilder->setMF(*MF);
   EntryBuilder->setMF(*MF);

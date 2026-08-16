@@ -29,7 +29,7 @@
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/GlobalISel/CSEInfo.h"
-#include "llvm/CodeGen/GlobalISel/CSEMIRBuilder.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/CodeGen/MLIRISel.h"
@@ -103,19 +103,15 @@ public:
     // reassociation rules that measurably behave differently on
     // non-CSE'd input, e.g. a multi-index GEP's constant-offset
     // G_PTR_ADD chain selected a different (but semantically equivalent)
-    // AArch64 addressing mode without this.
+    // AArch64 addressing mode without this. createMIRBuilder is shared
+    // with IRTranslator itself (Utils.h) for exactly this "CSEMIRBuilder
+    // wired to CSEInfo, or plain MachineIRBuilder" mechanics.
     auto &TPC = getAnalysis<TargetPassConfig>();
-    std::unique_ptr<MachineIRBuilder> Builder;
-    if (TPC.isGISelCSEEnabled()) {
-      auto CSEBuilder = std::make_unique<CSEMIRBuilder>(MF);
-      GISelCSEInfo &CSEInfo =
-          getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
-              TPC.getCSEConfig());
-      CSEBuilder->setCSEInfo(&CSEInfo);
-      Builder = std::move(CSEBuilder);
-    } else {
-      Builder = std::make_unique<MachineIRBuilder>(MF);
-    }
+    GISelCSEInfo *CSEInfo = nullptr;
+    if (TPC.isGISelCSEEnabled())
+      CSEInfo = &getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
+          TPC.getCSEConfig());
+    std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
     if (!FuncOp ||
         !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {

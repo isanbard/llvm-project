@@ -14,6 +14,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/CodeGenCommonISel.h"
+#include "llvm/CodeGen/GlobalISel/CSEMIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/GISelChangeObserver.h"
 #include "llvm/CodeGen/GlobalISel/GISelValueTracking.h"
 #include "llvm/CodeGen/GlobalISel/GenericMachineInstrs.h"
@@ -1136,6 +1137,15 @@ bool llvm::isKnownToBeAPowerOfTwo(Register Reg, const MachineRegisterInfo &MRI,
 
 void llvm::getSelectionDAGFallbackAnalysisUsage(AnalysisUsage &AU) {
   AU.addPreserved<StackProtector>();
+}
+
+std::unique_ptr<MachineIRBuilder>
+llvm::createMIRBuilder(MachineFunction &MF, GISelCSEInfo *CSEInfo) {
+  if (!CSEInfo)
+    return std::make_unique<MachineIRBuilder>(MF);
+  auto Builder = std::make_unique<CSEMIRBuilder>(MF);
+  Builder->setCSEInfo(CSEInfo);
+  return Builder;
 }
 
 LLT llvm::getLCMType(LLT OrigTy, LLT TargetTy) {
