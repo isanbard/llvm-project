@@ -8,6 +8,8 @@
 
 #include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Location.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
@@ -20,8 +22,6 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Alignment.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/Location.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -39,12 +39,12 @@ namespace {
 gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
   if (auto *IntTy = dyn_cast<llvm::IntegerType>(Ty))
     return gmir::LLTType::get(&Context, IntTy->getBitWidth(),
-                               /*numElements=*/0, /*addressSpace=*/0,
-                               /*isScalable=*/false);
+                              /*numElements=*/0, /*addressSpace=*/0,
+                              /*isScalable=*/false);
   if (auto *PtrTy = dyn_cast<llvm::PointerType>(Ty))
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
-                               /*numElements=*/0, PtrTy->getAddressSpace(),
-                               /*isScalable=*/false);
+                              /*numElements=*/0, PtrTy->getAddressSpace(),
+                              /*isScalable=*/false);
   return {};
 }
 
@@ -60,17 +60,16 @@ gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
 /// Types/Offsets in a possibly-partial state) if any leaf isn't a supported
 /// scalar/pointer type.
 bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
-                           llvm::Type *Ty, SmallVectorImpl<gmir::LLTType> &Types,
-                           SmallVectorImpl<uint64_t> &Offsets,
-                           uint64_t StartOffset = 0) {
+                          llvm::Type *Ty, SmallVectorImpl<gmir::LLTType> &Types,
+                          SmallVectorImpl<uint64_t> &Offsets,
+                          uint64_t StartOffset = 0) {
   if (Ty->isVoidTy())
     return true;
   if (auto *StTy = dyn_cast<llvm::StructType>(Ty)) {
     const StructLayout *SL = DL.getStructLayout(StTy);
     for (unsigned I = 0, E = StTy->getNumElements(); I != E; ++I) {
       if (!computeGMIRLeafTypes(Context, DL, StTy->getElementType(I), Types,
-                                 Offsets,
-                                 StartOffset + SL->getElementOffset(I)))
+                                Offsets, StartOffset + SL->getElementOffset(I)))
         return false;
     }
     return true;
@@ -80,7 +79,7 @@ bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
     uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
     for (uint64_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
       if (!computeGMIRLeafTypes(Context, DL, ElemTy, Types, Offsets,
-                                 StartOffset + I * ElemSize))
+                                StartOffset + I * ElemSize))
         return false;
     }
     return true;
@@ -302,7 +301,7 @@ private:
   /// already-valid object, not a user GEP, so it always gets the strong
   /// nuw+inbounds guarantee regardless of anything else).
   mlir::Value materializeLeafPtr(mlir::Value BasePtr, gmir::LLTType PtrTy,
-                                  gmir::LLTType OffsetTy, uint64_t Offset) {
+                                 gmir::LLTType OffsetTy, uint64_t Offset) {
     if (Offset == 0)
       return BasePtr;
     auto ConstOp = gmir::ConstantOp::create(
@@ -335,7 +334,8 @@ private:
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
     SmallVector<mlir::Value, 1> Results;
     for (auto [LeafTy, Offset] : zip(LeafTypes, Offsets)) {
-      mlir::Value LeafPtr = materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
+      mlir::Value LeafPtr =
+          materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
       Align LeafAlign = commonAlignment(LI.getAlign(), Offset);
       auto Op = gmir::LoadOp::create(
           Builder, Builder.getUnknownLoc(), LeafTy, LeafPtr,
@@ -355,7 +355,7 @@ private:
     SmallVector<gmir::LLTType, 1> LeafTypes;
     SmallVector<uint64_t, 1> Offsets;
     if (!computeGMIRLeafTypes(Context, *DL, SI.getValueOperand()->getType(),
-                               LeafTypes, Offsets))
+                              LeafTypes, Offsets))
       return false;
     SmallVector<mlir::Value, 1> ValueLeaves;
     mlir::Value BasePtr;
@@ -367,7 +367,8 @@ private:
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
     for (auto [ValueLeaf, Offset] : zip(ValueLeaves, Offsets)) {
-      mlir::Value LeafPtr = materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
+      mlir::Value LeafPtr =
+          materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
       Align LeafAlign = commonAlignment(SI.getAlign(), Offset);
       gmir::StoreOp::create(
           Builder, Builder.getUnknownLoc(), ValueLeaf, LeafPtr,
@@ -432,13 +433,12 @@ private:
     // PtrAddFlagsWithConst upgrade, applied only at constant-offset flush
     // points below, not the variable-index gmir.ptr_add further down.
     auto EmitConstOffset = [&](int64_t Offset) {
-      auto ConstOp = gmir::ConstantOp::create(
-          Builder, Builder.getUnknownLoc(), OffsetTy,
-          Builder.getI64IntegerAttr(Offset));
+      auto ConstOp =
+          gmir::ConstantOp::create(Builder, Builder.getUnknownLoc(), OffsetTy,
+                                   Builder.getI64IntegerAttr(Offset));
       bool UpgradedNoUWrap = NoUWrap || (NoUSWrap && Offset >= 0);
       auto AddOp = gmir::PtrAddOp::create(
-          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal,
-          ConstOp.getResult(),
+          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal, ConstOp.getResult(),
           UpgradedNoUWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
           NoUSWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
           InBounds ? Builder.getUnitAttr() : mlir::UnitAttr());
@@ -450,8 +450,7 @@ private:
          ++GTI) {
       llvm::Value *Idx = GTI.getOperand();
       if (llvm::StructType *StTy = GTI.getStructTypeOrNull()) {
-        unsigned Field =
-            cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
+        unsigned Field = cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
         Offset += DL->getStructLayout(StTy)->getElementOffset(Field);
         continue;
       }
@@ -483,7 +482,7 @@ private:
             Builder.getI64IntegerAttr(static_cast<int64_t>(ElementSize)));
         auto MulOp =
             gmir::MulOp::create(Builder, Builder.getUnknownLoc(), OffsetTy,
-                                 IdxVal, ElemSizeConst.getResult());
+                                IdxVal, ElemSizeConst.getResult());
         ScaledVal = MulOp.getResult();
       }
 
@@ -535,10 +534,10 @@ private:
     // elsewhere in this codebase; explicit `llvm::` qualification
     // required.
     static constexpr llvm::Attribute::AttrKind BannedParamAttrs[] = {
-        llvm::Attribute::ByVal,        llvm::Attribute::StructRet,
-        llvm::Attribute::InAlloca,     llvm::Attribute::Preallocated,
-        llvm::Attribute::ByRef,        llvm::Attribute::SwiftError,
-        llvm::Attribute::SwiftSelf,    llvm::Attribute::SwiftAsync};
+        llvm::Attribute::ByVal,     llvm::Attribute::StructRet,
+        llvm::Attribute::InAlloca,  llvm::Attribute::Preallocated,
+        llvm::Attribute::ByRef,     llvm::Attribute::SwiftError,
+        llvm::Attribute::SwiftSelf, llvm::Attribute::SwiftAsync};
     for (unsigned I = 0, E = CI.arg_size(); I != E; ++I)
       for (llvm::Attribute::AttrKind Kind : BannedParamAttrs)
         if (CI.paramHasAttr(I, Kind))
@@ -557,7 +556,7 @@ private:
       SmallVector<gmir::LLTType, 1> LeafTypes;
       SmallVector<uint64_t, 1> Offsets;
       if (!computeGMIRLeafTypes(Context, *DL, Arg->getType(), LeafTypes,
-                                 Offsets))
+                                Offsets))
         return false;
       SmallVector<mlir::Value, 1> ArgLeaves;
       if (!getOperands(Arg, ArgLeaves) || ArgLeaves.size() != LeafTypes.size())
@@ -569,7 +568,8 @@ private:
     mlir::Location Loc = mlir::OpaqueLoc::get<llvm::CallInst *>(&CI, &Context);
     auto Op = gmir::CallOp::create(
         Builder, Loc, RetTy ? mlir::TypeRange(RetTy) : mlir::TypeRange(),
-        mlir::FlatSymbolRefAttr::get(&Context, cast<GlobalValue>(CalleeV)->getName()),
+        mlir::FlatSymbolRefAttr::get(&Context,
+                                     cast<GlobalValue>(CalleeV)->getName()),
         Builder.getI64IntegerAttr(static_cast<int64_t>(CI.getCallingConv())),
         FlatArgs, Builder.getDenseI32ArrayAttr(LeafCounts));
     if (RetTy)

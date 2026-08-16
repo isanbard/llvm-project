@@ -72,9 +72,8 @@ Block *CondBrOp::getSuccessorForOperands(ArrayRef<mlir::Attribute> operands) {
 // blanket `using namespace mlir;` + the ambient `using namespace llvm;` --
 // same class of ambiguity as Value/Type/Attribute/DataLayout above,
 // explicitly qualified for the same reason.
-void LoadOp::getEffects(
-    SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
-        &effects) {
+void LoadOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                            mlir::MemoryEffects::Effect>> &effects) {
   effects.emplace_back(mlir::MemoryEffects::Read::get(), &getPtrMutable());
   if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
     effects.emplace_back(mlir::MemoryEffects::Write::get());
@@ -82,9 +81,8 @@ void LoadOp::getEffects(
   }
 }
 
-void StoreOp::getEffects(
-    SmallVectorImpl<mlir::SideEffects::EffectInstance<mlir::MemoryEffects::Effect>>
-        &effects) {
+void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
+                             mlir::MemoryEffects::Effect>> &effects) {
   effects.emplace_back(mlir::MemoryEffects::Write::get(), &getPtrMutable());
   if (getIsVolatile() || getOrderingAttr().getInt() != 0) {
     effects.emplace_back(mlir::MemoryEffects::Write::get());

@@ -19,6 +19,11 @@
 #include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
 #include "MLIRToGMIRTranslator.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
@@ -32,11 +37,6 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/StackProtector.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Location.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/OwningOpRef.h"
 
 using namespace llvm;
 
