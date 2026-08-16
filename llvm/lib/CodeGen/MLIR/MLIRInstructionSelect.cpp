@@ -24,6 +24,7 @@
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/GlobalISel/CSEInfo.h"
+#include "llvm/CodeGen/GlobalISel/CSEMIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/CodeGen/MLIRISel.h"
@@ -94,7 +95,30 @@ public:
     mlir::func::FuncOp FuncOp =
         gmir::importFunction(*Module, MF.getFunction());
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
-    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI)) {
+
+    // Match IRTranslator::translate's own choice of builder exactly (see
+    // MLIRToGMIRTranslator.h's translate() doc comment for why a plain
+    // MachineIRBuilder isn't just a style difference here): downstream
+    // combiner passes reused unchanged from the real pipeline have
+    // reassociation rules that measurably behave differently on
+    // non-CSE'd input, e.g. a multi-index GEP's constant-offset
+    // G_PTR_ADD chain selected a different (but semantically equivalent)
+    // AArch64 addressing mode without this.
+    auto &TPC = getAnalysis<TargetPassConfig>();
+    std::unique_ptr<MachineIRBuilder> Builder;
+    if (TPC.isGISelCSEEnabled()) {
+      auto CSEBuilder = std::make_unique<CSEMIRBuilder>(MF);
+      GISelCSEInfo &CSEInfo =
+          getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
+              TPC.getCSEConfig());
+      CSEBuilder->setCSEInfo(&CSEInfo);
+      Builder = std::move(CSEBuilder);
+    } else {
+      Builder = std::make_unique<MachineIRBuilder>(MF);
+    }
+
+    if (!FuncOp ||
+        !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
       // Outside M1's supported subset, or CallLowering itself declined:
       // defer to the existing selector, same as always.
       MF.getProperties().setFailedISel();

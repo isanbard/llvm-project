@@ -37,3 +37,16 @@ entry:
   %v = load i32, ptr %p
   ret i32 %v
 }
+
+define <4 x ptr> @vector_gep(<4 x ptr> %p, i64 %i) {
+entry:
+  %g = getelementptr i32, <4 x ptr> %p, i64 %i
+  ret <4 x ptr> %g
+}
+
+define i32 @narrow_index_gep(ptr %p, i32 %i) {
+entry:
+  %g = getelementptr i32, ptr %p, i32 %i
+  %v = load i32, ptr %g
+  ret i32 %v
+}

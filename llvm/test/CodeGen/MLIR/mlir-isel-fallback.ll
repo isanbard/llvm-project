@@ -20,6 +20,12 @@
 ; and static-alloca/load/store are now genuinely translated instead of
 ; always falling back; see scalar-arith.ll, control-flow.ll, and
 ; memory-ops.ll.)
+;
+; @vector_gep and @narrow_index_gep additionally cover importGEP's two
+; bail-out conditions (see gep.ll for the genuinely-translated GEP cases):
+; a vector-typed GEP, and a variable index whose bit width doesn't match
+; the pointer-index type's width (gmir has no sext/trunc op yet to fix
+; that up).
 
 declare i32 @callee(i32)
 
@@ -47,5 +53,18 @@ entry:
   %p = alloca i32, i32 %n
   store i32 0, ptr %p
   %v = load i32, ptr %p
+  ret i32 %v
+}
+
+define <4 x ptr> @vector_gep(<4 x ptr> %p, i64 %i) {
+entry:
+  %g = getelementptr i32, <4 x ptr> %p, i64 %i
+  ret <4 x ptr> %g
+}
+
+define i32 @narrow_index_gep(ptr %p, i32 %i) {
+entry:
+  %g = getelementptr i32, ptr %p, i32 %i
+  %v = load i32, ptr %g
   ret i32 %v
 }

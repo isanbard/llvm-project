@@ -311,6 +311,22 @@ private:
       return true;
     }
 
+    if (auto PtrAdd = dyn_cast<gmir::PtrAddOp>(&Op)) {
+      Register PtrReg = ValueToReg.lookup(PtrAdd.getPtr());
+      Register OffReg = ValueToReg.lookup(PtrAdd.getOffset());
+      LLT Ty = convertLLT(cast<gmir::LLTType>(PtrAdd.getResult().getType()), DL);
+      unsigned Flags = 0;
+      if (PtrAdd.getNoUWrap())
+        Flags |= MachineInstr::MIFlag::NoUWrap;
+      if (PtrAdd.getNoUSWrap())
+        Flags |= MachineInstr::MIFlag::NoUSWrap;
+      if (PtrAdd.getInBounds())
+        Flags |= MachineInstr::MIFlag::InBounds;
+      auto MIB = MIRBuilder.buildPtrAdd(Ty, PtrReg, OffReg, Flags);
+      ValueToReg[PtrAdd.getResult()] = MIB.getReg(0);
+      return true;
+    }
+
     // GMIRImporter only ever emits the ops handled above (plus
     // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
     return false;
@@ -347,7 +363,8 @@ private:
 } // namespace
 
 bool gmir::translate(func::FuncOp FuncOp, Function &F, MachineFunction &MF,
-                      const BranchProbabilityInfo &BPI) {
+                      const BranchProbabilityInfo &BPI,
+                      MachineIRBuilder &MIRBuilder) {
   const CallLowering *CLI = MF.getSubtarget().getCallLowering();
 
   FunctionLoweringInfo FuncInfo;
@@ -359,8 +376,6 @@ bool gmir::translate(func::FuncOp FuncOp, Function &F, MachineFunction &MF,
   // so left null rather than const_cast-ing BPI away just to populate it.
   FuncInfo.BPI = nullptr;
   FuncInfo.CanLowerReturn = CLI->checkReturnTypeForCallConv(MF);
-
-  MachineIRBuilder MIRBuilder(MF);
 
   return GMIRToMIRWalker(MF, MIRBuilder, *CLI, BPI).run(FuncOp, F, FuncInfo);
 }

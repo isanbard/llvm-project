@@ -174,4 +174,26 @@ def GMIR_StoreOp : GMIR_Op<"store",
                        UnitAttr:$isVolatile);
 }
 
+def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
+  let summary = "Pointer + integer offset, mirroring GlobalISel's G_PTR_ADD";
+  let description = [{
+    `noUWrap`/`noUSWrap`/`inBounds` mirror MachineInstr::MIFlag::NoUWrap/
+    NoUSWrap/InBounds (see MachineInstr::copyFlagsFromInstruction's
+    GetElementPtrInst case) -- UnitAttrs, matching `gmir.load`/
+    `gmir.store`'s `isVolatile` convention for boolean flags rather than a
+    packed bitmask. The importer emits one `gmir.ptr_add` per coalesced
+    constant-offset flush point and one per variable GEP index, mirroring
+    IRTranslator::translateGetElementPtr's coalescing algorithm exactly
+    (ported for -global-isel byte-parity rather than a naive
+    one-ptr_add-per-index scheme -- see design doc §1.5's GEP bullet).
+    Also reused (starting in a later milestone slice) for materializing a
+    sub-object byte offset within an already-flattened aggregate
+    load/store, unrelated to any user-written GEP.
+  }];
+  let arguments = (ins GMIR_LLTType:$ptr, GMIR_LLTType:$offset,
+                       UnitAttr:$noUWrap, UnitAttr:$noUSWrap,
+                       UnitAttr:$inBounds);
+  let results = (outs GMIR_LLTType:$res); // always a pointer LLT
+}
+
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD

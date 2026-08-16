@@ -11,7 +11,9 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Operator.h"
 #include "mlir/IR/Builders.h"
 
 using namespace llvm;
@@ -182,8 +184,13 @@ private:
           return false;
         continue;
       }
-      // Anything else (calls, GEPs, switches, casts, selects, ...) is out
-      // of scope for this milestone slice -- fall back rather than
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (!importGEP(*GEP))
+          return false;
+        continue;
+      }
+      // Anything else (calls, switches, casts, selects, ...) is out of
+      // scope for this milestone slice -- fall back rather than
       // mistranslate. Note: `select` and `switch` are reachable even from
       // simple hand-written diamond/chained-if IR, since llc's own IR-level
       // pipeline (CodeGenPrepare/SimplifyCFG-style passes) canonicalizes
@@ -312,6 +319,131 @@ private:
         Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getOrdering())),
         Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
         SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr());
+    return true;
+  }
+
+  /// Imports a scalar/pointer-only GetElementPtrInst, porting
+  /// IRTranslator::translateGetElementPtr's constant-index-coalescing
+  /// algorithm exactly (for -global-isel byte parity on multi-index GEPs,
+  /// rather than a naive one-ptr_add-per-index scheme): runs of constant
+  /// struct-field/array indices accumulate into a single running offset,
+  /// flushed into one gmir.constant+gmir.ptr_add only when a variable
+  /// index is hit and (if still nonzero) once more at the end; each
+  /// variable index gets its own gmir.mul (skipped when the element size
+  /// is 1) + gmir.ptr_add. Bails (falls back to the legacy selector) for:
+  /// vector GEPs (result or pointer-operand type isa<VectorType> --
+  /// catches scalable vectors too, since ScalableVectorType inherits
+  /// VectorType; stricter than this checkout's own
+  /// translateGetElementPtr, which has a latent unguarded
+  /// cast<FixedVectorType> for the scalable case); and any variable index
+  /// whose integer bit width doesn't match the pointer-index type's
+  /// width, since gmir has no sext/trunc op yet to fix that up (see
+  /// gmir.ptr_add's doc comment).
+  bool importGEP(GetElementPtrInst &GEP) {
+    // llvm::VectorType vs. mlir::VectorType collide under this file's
+    // blanket `using namespace llvm;`/`using namespace mlir;` -- same
+    // class of ambiguity as Value/Type/Attribute/DenseMap noted elsewhere
+    // in this codebase; explicit `llvm::` qualification required.
+    if (isa<llvm::VectorType>(GEP.getType()) ||
+        isa<llvm::VectorType>(GEP.getPointerOperandType()))
+      return false;
+
+    mlir::Value BaseVal;
+    if (!getOperand(GEP.getPointerOperand(), BaseVal))
+      return false;
+
+    auto &GEPOp = cast<GEPOperator>(GEP);
+    if (GEPOp.hasAllZeroIndices()) {
+      ValueMap[&GEP] = BaseVal;
+      return true;
+    }
+
+    gmir::LLTType PtrTy = convertType(Context, GEP.getType());
+    if (!PtrTy)
+      return false;
+
+    llvm::Type *OffsetIRTy = DL->getIndexType(GEP.getPointerOperandType());
+    unsigned IndexBitWidth = OffsetIRTy->getIntegerBitWidth();
+    gmir::LLTType OffsetTy = convertType(Context, OffsetIRTy);
+
+    bool NoUWrap = GEPOp.hasNoUnsignedWrap();
+    bool NoUSWrap = GEPOp.hasNoUnsignedSignedWrap();
+    bool InBounds = GEPOp.isInBounds();
+
+    // A nonnegative constant offset added on top of a nusw/inbounds
+    // pointer can't unsigned-wrap either -- IRTranslator.cpp's
+    // PtrAddFlagsWithConst upgrade, applied only at constant-offset flush
+    // points below, not the variable-index gmir.ptr_add further down.
+    auto EmitConstOffset = [&](int64_t Offset) {
+      auto ConstOp = gmir::ConstantOp::create(
+          Builder, Builder.getUnknownLoc(), OffsetTy,
+          Builder.getI64IntegerAttr(Offset));
+      bool UpgradedNoUWrap = NoUWrap || (NoUSWrap && Offset >= 0);
+      auto AddOp = gmir::PtrAddOp::create(
+          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal,
+          ConstOp.getResult(),
+          UpgradedNoUWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          NoUSWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          InBounds ? Builder.getUnitAttr() : mlir::UnitAttr());
+      BaseVal = AddOp.getResult();
+    };
+
+    int64_t Offset = 0;
+    for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
+         ++GTI) {
+      llvm::Value *Idx = GTI.getOperand();
+      if (llvm::StructType *StTy = GTI.getStructTypeOrNull()) {
+        unsigned Field =
+            cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
+        Offset += DL->getStructLayout(StTy)->getElementOffset(Field);
+        continue;
+      }
+      uint64_t ElementSize = GTI.getSequentialElementStride(*DL);
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        if (auto Val = CI->getValue().trySExtValue()) {
+          Offset += ElementSize * *Val;
+          continue;
+        }
+      }
+
+      // Variable index: flush any accumulated constant offset first, then
+      // emit Idx * ElementSize (if needed) + a ptr_add for Idx itself.
+      if (Idx->getType()->getIntegerBitWidth() != IndexBitWidth)
+        return false;
+      if (Offset != 0) {
+        EmitConstOffset(Offset);
+        Offset = 0;
+      }
+
+      mlir::Value IdxVal;
+      if (!getOperand(Idx, IdxVal))
+        return false;
+
+      mlir::Value ScaledVal = IdxVal;
+      if (ElementSize != 1) {
+        auto ElemSizeConst = gmir::ConstantOp::create(
+            Builder, Builder.getUnknownLoc(), OffsetTy,
+            Builder.getI64IntegerAttr(static_cast<int64_t>(ElementSize)));
+        auto MulOp =
+            gmir::MulOp::create(Builder, Builder.getUnknownLoc(), OffsetTy,
+                                 IdxVal, ElemSizeConst.getResult());
+        ScaledVal = MulOp.getResult();
+      }
+
+      // Raw (non-const-upgraded) flags for the variable-index add, per
+      // IRTranslator.cpp.
+      auto AddOp = gmir::PtrAddOp::create(
+          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal, ScaledVal,
+          NoUWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          NoUSWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          InBounds ? Builder.getUnitAttr() : mlir::UnitAttr());
+      BaseVal = AddOp.getResult();
+    }
+
+    if (Offset != 0)
+      EmitConstOffset(Offset);
+
+    ValueMap[&GEP] = BaseVal;
     return true;
   }
 
