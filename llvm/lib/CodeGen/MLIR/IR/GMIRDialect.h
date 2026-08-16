@@ -21,12 +21,18 @@
 #ifndef LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_H
 #define LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_H
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "IR/GMIRDialect.h.inc"
 
 #define GET_TYPEDEF_CLASSES
 #include "IR/GMIRDialectTypes.h.inc"
+
+#define GET_OP_CLASSES
+#include "IR/GMIRDialectOps.h.inc"
 
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_H

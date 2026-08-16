@@ -24,9 +24,16 @@ using namespace llvm::gmir;
 #define GET_TYPEDEF_CLASSES
 #include "IR/GMIRDialectTypes.cpp.inc"
 
+#define GET_OP_CLASSES
+#include "IR/GMIRDialectOps.cpp.inc"
+
 void GMIRDialect::initialize() {
   addTypes<
 #define GET_TYPEDEF_LIST
 #include "IR/GMIRDialectTypes.cpp.inc"
+      >();
+  addOperations<
+#define GET_OP_LIST
+#include "IR/GMIRDialectOps.cpp.inc"
       >();
 }

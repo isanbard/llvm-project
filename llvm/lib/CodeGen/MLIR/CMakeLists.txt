@@ -16,19 +16,25 @@ mlir_tablegen(IR/GMIRDialect.h.inc -gen-dialect-decls)
 mlir_tablegen(IR/GMIRDialect.cpp.inc -gen-dialect-defs)
 mlir_tablegen(IR/GMIRDialectTypes.h.inc -gen-typedef-decls)
 mlir_tablegen(IR/GMIRDialectTypes.cpp.inc -gen-typedef-defs)
+mlir_tablegen(IR/GMIRDialectOps.h.inc -gen-op-decls)
+mlir_tablegen(IR/GMIRDialectOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(MLIRGMIRDialectIncGen)
 
 add_llvm_component_library(LLVMCodeGenMLIR
+  GMIRImporter.cpp
   IR/GMIRDialect.cpp
   MLIRInstructionSelect.cpp
+  MLIRToGMIRTranslator.cpp
 
   DEPENDS
   MLIRGMIRDialectIncGen
 
   LINK_LIBS PUBLIC
   MLIRIR
+  MLIRFuncDialect
 
   LINK_COMPONENTS
   CodeGen
+  GlobalISel
   Support
   )

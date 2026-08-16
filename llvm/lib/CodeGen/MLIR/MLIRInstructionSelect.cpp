@@ -6,23 +6,36 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This is the M1-scaffolding version of the MLIR ISel pass: it registers
-// and loads the `gmir` MLIR dialect (proving the dialect + MLIRContext
-// wiring builds and runs), then unconditionally defers to the existing
-// selector by marking the MachineFunction's ISel as failed. Real op
-// translation is deferred to a later iteration -- see
-// ~/llvm/mlir_instruction_selection_plan.md, "Deferred to next iteration".
+// Imports the current MachineFunction's llvm::Function into `gmir` ops
+// (GMIRImporter) and, if that succeeds, translates them into real generic
+// MIR (MLIRToGMIRTranslator). Both steps only ever handle M1's supported
+// subset (straight-line scalar-integer arithmetic); anything else makes
+// the importer fail, in which case this pass defers to the existing
+// selector exactly as it always has. See
+// ~/llvm/mlir_instruction_selection_plan.md for the full architecture.
 //
 //===----------------------------------------------------------------------===//
 
+#include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
+#include "MLIRToGMIRTranslator.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/BranchProbabilityInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/CodeGen/GlobalISel/CSEInfo.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
+#include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/CodeGen/MLIRISel.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/StackProtector.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 
 using namespace llvm;
 
@@ -45,27 +58,47 @@ public:
 
   StringRef getPassName() const override { return "MLIR Instruction Select"; }
 
-  // Mirrors GlobalISel::IRTranslator::getAnalysisUsage(): this pass occupies
-  // the same pipeline position (first MachineFunctionPass before the
-  // SelectionDAG fallback), and without declaring the same requirements the
-  // legacy PassManager fails to keep 'Function Alias Analysis Results' alive
-  // for the fallback X86 DAG selector, aborting with "Unable to schedule
-  // pass" -- getSelectionDAGFallbackAnalysisUsage() is the fix GlobalISel's
-  // own passes use for exactly this fallback-path scheduling issue.
+  // Mirrors GlobalISel::IRTranslator::getAnalysisUsage() exactly (down to
+  // requirements this pass doesn't itself use, like GISelCSEAnalysisWrapperPass
+  // and LibcallLoweringInfoWrapper): this pass occupies the same pipeline
+  // position (first MachineFunctionPass before Legalize/RegBankSelect/
+  // InstructionSelect and the SelectionDAG fallback), and a *partial* match
+  // to IRTranslator's declared requirements was empirically insufficient --
+  // the legacy PassManager still failed to keep 'Function Alias Analysis
+  // Results' alive for the fallback X86 DAG selector once
+  // Legalize/RegBankSelect/InstructionSelect were chained after this pass
+  // (see TargetPassConfig::addCoreISelPasses), aborting with "Unable to
+  // schedule pass". Matching IRTranslator's requirements fully avoids
+  // whatever legacy-PM scheduling decision that partial match was causing.
   void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<StackProtector>();
     AU.addRequired<TargetPassConfig>();
+    AU.addRequired<GISelCSEAnalysisWrapperPass>();
+    AU.addRequired<AssumptionCacheTracker>();
+    AU.addRequired<BranchProbabilityInfoWrapperPass>();
     AU.addRequired<AAResultsWrapperPass>();
+    AU.addRequired<TargetLibraryInfoWrapperPass>();
+    AU.addPreserved<TargetLibraryInfoWrapperPass>();
+    AU.addRequired<LibcallLoweringInfoWrapper>();
     getSelectionDAGFallbackAnalysisUsage(AU);
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    // Proves the dialect registers and loads cleanly; nothing is
-    // translated yet, so every function currently falls back.
     mlir::MLIRContext Context;
     Context.getOrLoadDialect<gmir::GMIRDialect>();
+    Context.getOrLoadDialect<mlir::func::FuncDialect>();
 
-    MF.getProperties().setFailedISel();
+    mlir::OwningOpRef<mlir::ModuleOp> Module(
+        mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
+    mlir::func::FuncOp FuncOp =
+        gmir::importFunction(*Module, MF.getFunction());
+    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF)) {
+      // Outside M1's supported subset, or CallLowering itself declined:
+      // defer to the existing selector, same as always.
+      MF.getProperties().setFailedISel();
+      return false;
+    }
     return false;
   }
 };

@@ -584,6 +584,9 @@ if config.link_llvm_dylib:
 if config.have_tf_aot:
     config.available_features.add("have_tf_aot")
 
+if config.llvm_enable_mlir_isel:
+    config.available_features.add("llvm_enable_mlir_isel")
+
 if getattr(config, "have_opencsd", False):
     config.available_features.add("opencsd")
 

@@ -8,9 +8,9 @@
 //
 // This file declares the `gmir` dialect: an MLIR mirror of GlobalISel's
 // generic MIR, used as the target of the experimental MLIR-based
-// instruction-selection pipeline. This scaffolding slice defines the
-// dialect and its `!gmir.llt` type (mirroring GlobalISel's LLT) only --
-// no operations yet.
+// instruction-selection pipeline. Ops are limited to what M1's
+// straight-line scalar-arithmetic slice needs; see
+// ~/llvm/mlir_instruction_selection_plan.md for the roadmap.
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,6 +18,8 @@
 #define LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 def GMIR_Dialect : Dialect {
   let name = "gmir";
@@ -50,6 +52,37 @@ def GMIR_LLTType : GMIR_Type<"LLT", "llt"> {
   );
   let assemblyFormat = "`<` $scalarSizeInBits `,` $numElements `,` "
                         "$addressSpace `,` $isScalable `>`";
+}
+
+class GMIR_Op<string mnemonic, list<Trait> traits = []>
+    : Op<GMIR_Dialect, mnemonic, traits>;
+
+class GMIR_BinOp<string mnemonic, list<Trait> traits = []>
+    : GMIR_Op<mnemonic, !listconcat(traits, [Pure, SameOperandsAndResultType])> {
+  let arguments = (ins GMIR_LLTType:$lhs, GMIR_LLTType:$rhs);
+  let results = (outs GMIR_LLTType:$res);
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($res)";
+}
+
+def GMIR_AddOp  : GMIR_BinOp<"add",  [Commutative]>;
+def GMIR_SubOp  : GMIR_BinOp<"sub">;
+def GMIR_MulOp  : GMIR_BinOp<"mul",  [Commutative]>;
+def GMIR_SDivOp : GMIR_BinOp<"sdiv">;
+def GMIR_AndOp  : GMIR_BinOp<"and",  [Commutative]>;
+def GMIR_OrOp   : GMIR_BinOp<"or",   [Commutative]>;
+def GMIR_XorOp  : GMIR_BinOp<"xor",  [Commutative]>;
+
+def GMIR_ConstantOp : GMIR_Op<"constant", [Pure, ConstantLike]> {
+  let summary = "A constant of `!gmir.llt` type";
+  let description = [{
+    Holds a 64-bit value (signless: the bit pattern, not a signedness
+    claim -- signedness is a property of the consuming op, e.g. `gmir.sdiv`).
+    Constants that don't fit in 64 bits are unsupported for now (M1 is
+    scoped to i32/i64 scalar arithmetic).
+  }];
+  let arguments = (ins I64Attr:$value);
+  let results = (outs GMIR_LLTType:$res);
+  let assemblyFormat = "$value attr-dict `:` type($res)";
 }
 
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD
