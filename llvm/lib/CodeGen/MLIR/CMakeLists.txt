@@ -22,6 +22,7 @@ add_public_tablegen_target(MLIRGMIRDialectIncGen)
 
 add_llvm_component_library(LLVMCodeGenMLIR
   GMIRImporter.cpp
+  GMIRLegalizer.cpp
   IR/GMIRDialect.cpp
   MLIRInstructionSelect.cpp
   MLIRToGMIRTranslator.cpp
@@ -32,6 +33,7 @@ add_llvm_component_library(LLVMCodeGenMLIR
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRFuncDialect
+  MLIRTransformUtils
 
   LINK_COMPONENTS
   CodeGen

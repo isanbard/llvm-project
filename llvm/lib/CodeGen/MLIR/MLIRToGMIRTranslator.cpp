@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MLIRToGMIRTranslator.h"
+#include "GMIRLLTConversion.h"
 #include "IR/GMIRDialect.h"
 #include "mlir/IR/Location.h"
 #include "llvm/ADT/APInt.h"
@@ -24,29 +25,6 @@
 
 using namespace llvm;
 using namespace mlir;
-
-// scalarSizeInBits == 0 means "pointer in addressSpace" (see GMIRDialect.td's
-// !gmir.llt doc comment) -- pointer size itself needs a DataLayout, hence
-// the extra parameter (M1/M2 never needed one; only scalar ints existed).
-//
-// This checkout's LLT (LowLevelType.h) is a real fork-specific extension
-// beyond upstream LLVM: it distinguishes Kind::INTEGER (LLT::integer(N),
-// prints "iN") from a generic untyped Kind::ANY_SCALAR (LLT::scalar(N),
-// prints "sN") -- upstream LLT has no such split. Using LLT::scalar() here
-// (as M1/M2 always did) silently produced ANY_SCALAR operands that AArch64's
-// InstructionSelect tablegen patterns don't match (they require isInteger()
-// specifically) while X86's happened to be permissive enough not to care --
-// masked entirely until now because a separate CallLowering::lowerReturn
-// overload-resolution bug (see lowerReturn's comment) made every non-void
-// AArch64 function fail earlier, before InstructionSelect ever got to
-// reject the wrong LLT kind. Every gmir integer value must use
-// LLT::integer(), not LLT::scalar().
-static LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
-  if (Ty.getScalarSizeInBits() == 0)
-    return LLT::pointer(Ty.getAddressSpace(),
-                        DL.getPointerSizeInBits(Ty.getAddressSpace()));
-  return LLT::integer(Ty.getScalarSizeInBits());
-}
 
 namespace {
 /// Bridges a `gmir`-only mlir::func::FuncOp into MF's MachineIR.
@@ -276,6 +254,86 @@ private:
                      MIRBuilder.buildInstr(TargetOpcode::G_SDIV, {Ty},
                                            {LHS, RHS}))
 #undef GMIR_BINOP_CASE
+
+    // gmir.uaddo/uadde/usubo/usube -> G_U{ADD,SUB}{O,E}, and gmir.unmerge/
+    // merge -> G_UNMERGE_VALUES/G_MERGE_VALUES: emitted only by
+    // GMIRLegalizer's NarrowScalarAddSubPattern (see GMIRLegalizer.cpp),
+    // never by GMIRImporter directly. Must be handled here regardless: once
+    // the legalizer rewrites a gmir.add/sub into this sequence, this
+    // translator is the only thing standing between it and a "leave it for
+    // the legacy selector" fallback, which would silently defeat the whole
+    // point of the legalizer slice.
+#define GMIR_ADDSUBCARRYO_CASE(OpTy, Build)                                    \
+  if (auto CarryOp = dyn_cast<gmir::OpTy>(&Op)) {                              \
+    Register LHS = ValueToReg.lookup(CarryOp.getLhs());                        \
+    Register RHS = ValueToReg.lookup(CarryOp.getRhs());                        \
+    LLT DstTy =                                                                \
+        convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);       \
+    LLT CarryTy =                                                              \
+        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);  \
+    Register DstReg =                                                          \
+        MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);              \
+    Register CarryReg =                                                        \
+        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);            \
+    Build;                                                                     \
+    ValueToReg[CarryOp.getDst()] = DstReg;                                     \
+    ValueToReg[CarryOp.getCarryOut()] = CarryReg;                              \
+    return true;                                                               \
+  }
+    GMIR_ADDSUBCARRYO_CASE(UAddOOp,
+                           MIRBuilder.buildUAddo(DstReg, CarryReg, LHS, RHS))
+    GMIR_ADDSUBCARRYO_CASE(USubOOp,
+                           MIRBuilder.buildUSubo(DstReg, CarryReg, LHS, RHS))
+#undef GMIR_ADDSUBCARRYO_CASE
+
+#define GMIR_ADDSUBCARRYE_CASE(OpTy, Build)                                    \
+  if (auto CarryOp = dyn_cast<gmir::OpTy>(&Op)) {                              \
+    Register LHS = ValueToReg.lookup(CarryOp.getLhs());                        \
+    Register RHS = ValueToReg.lookup(CarryOp.getRhs());                        \
+    Register CarryInReg = ValueToReg.lookup(CarryOp.getCarryIn());             \
+    LLT DstTy =                                                                \
+        convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);       \
+    LLT CarryTy =                                                              \
+        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);  \
+    Register DstReg =                                                          \
+        MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);              \
+    Register CarryReg =                                                        \
+        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);            \
+    Build;                                                                     \
+    ValueToReg[CarryOp.getDst()] = DstReg;                                     \
+    ValueToReg[CarryOp.getCarryOut()] = CarryReg;                              \
+    return true;                                                               \
+  }
+    GMIR_ADDSUBCARRYE_CASE(
+        UAddEOp, MIRBuilder.buildUAdde(DstReg, CarryReg, LHS, RHS, CarryInReg))
+    GMIR_ADDSUBCARRYE_CASE(
+        USubEOp, MIRBuilder.buildUSube(DstReg, CarryReg, LHS, RHS, CarryInReg))
+#undef GMIR_ADDSUBCARRYE_CASE
+
+    if (auto Unmerge = dyn_cast<gmir::UnmergeOp>(&Op)) {
+      Register SrcReg = ValueToReg.lookup(Unmerge.getSrc());
+      SmallVector<Register, 4> DstRegs;
+      for (mlir::Value Dst : Unmerge.getDsts()) {
+        LLT Ty = convertLLT(cast<gmir::LLTType>(Dst.getType()), DL);
+        DstRegs.push_back(
+            MIRBuilder.getMRI()->createGenericVirtualRegister(Ty));
+      }
+      MIRBuilder.buildUnmerge(DstRegs, SrcReg);
+      for (auto [Dst, Reg] : zip(Unmerge.getDsts(), DstRegs))
+        ValueToReg[Dst] = Reg;
+      return true;
+    }
+
+    if (auto Merge = dyn_cast<gmir::MergeOp>(&Op)) {
+      SmallVector<Register, 4> SrcRegs;
+      for (mlir::Value Src : Merge.getSrcs())
+        SrcRegs.push_back(ValueToReg.lookup(Src));
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Merge.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildMergeValues(Res, SrcRegs);
+      ValueToReg[Merge.getResult()] = Res;
+      return true;
+    }
 
     if (auto Alloca = dyn_cast<gmir::AllocaOp>(&Op)) {
       LLT Ty =

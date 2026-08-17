@@ -25,6 +25,15 @@ def GMIR_Dialect : Dialect {
   let name = "gmir";
   let summary = "Mirrors GlobalISel's generic MIR (gMIR)";
   let cppNamespace = "::llvm::gmir";
+  // Wires up the generatedTypePrinter/generatedTypeParser functions
+  // -gen-typedef-defs already emits (previously unused: nothing textually
+  // printed or parsed `gmir` IR before M4 slice 1's -print-gmir-after-
+  // legalize debug flag). Without this, MLIRContext's generic asm printer
+  // hits "dialect has no registered type printing hook" and aborts the
+  // moment it needs to print a bare !gmir.llt (e.g. a FuncOp's argument
+  // list) -- gmir ops themselves only ever used custom assemblyFormat or
+  // were never printed at all until now.
+  let useDefaultTypePrinterParser = 1;
 }
 
 class GMIR_Type<string name, string typeMnemonic, list<Trait> traits = [],
@@ -79,10 +88,19 @@ def GMIR_ConstantOp : GMIR_Op<"constant", [Pure, ConstantLike]> {
     claim -- signedness is a property of the consuming op, e.g. `gmir.sdiv`).
     Constants that don't fit in 64 bits are unsupported for now (M1 is
     scoped to i32/i64 scalar arithmetic).
+
+    `hasFolder = 1`: the `ConstantLike` trait's contract requires a working
+    `fold()` (returning the op's own value attribute) -- e.g. the greedy
+    pattern rewrite driver's constant-CSE step (GreedyRewriteConfig's
+    `cseConstants`, on by default; see GMIRLegalizer.cpp) walks every
+    ConstantLike op expecting this, and asserts if it's missing. Unused
+    until M4 slice 1 introduced the first pass (GMIRLegalizer) that runs
+    applyPatternsGreedily over gmir IR at all.
   }];
   let arguments = (ins I64Attr:$value);
   let results = (outs GMIR_LLTType:$res);
   let assemblyFormat = "$value attr-dict `:` type($res)";
+  let hasFolder = 1;
 }
 
 def GMIR_ICmpOp : GMIR_Op<"icmp", [Pure]> {
@@ -208,6 +226,65 @@ def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
                        UnitAttr:$noUWrap, UnitAttr:$noUSWrap,
                        UnitAttr:$inBounds);
   let results = (outs GMIR_LLTType:$res); // always a pointer LLT
+}
+
+class GMIR_AddSubCarryOp<string mnemonic, list<Trait> traits = []>
+    : GMIR_Op<mnemonic, !listconcat(traits, [Pure])> {
+  let summary = "Add/sub with carry, mirroring GlobalISel's G_U{ADD,SUB}{O,E}";
+  let description = [{
+    `dst`/`carryOut` mirror the two results of `G_UADDO`/`G_UADDE`/
+    `G_USUBO`/`G_USUBE` -- `carryOut` is a boolean-width (`!gmir.llt<1, ...>`)
+    result, not the same type as `dst`, which is why this doesn't reuse
+    `GMIR_BinOp` (its `SameOperandsAndResultType` doesn't fit). Emitted only
+    by GMIRLegalizer's NarrowScalarAddSubPattern (see GMIRLegalizer.cpp) --
+    GMIRImporter never produces these directly, since LLVM IR has no
+    surface-level add-with-carry construct that survives to this pipeline's
+    supported subset.
+  }];
+  let results = (outs GMIR_LLTType:$dst, GMIR_LLTType:$carryOut);
+}
+
+def GMIR_UAddOOp : GMIR_AddSubCarryOp<"uaddo", [Commutative]> {
+  let arguments = (ins GMIR_LLTType:$lhs, GMIR_LLTType:$rhs);
+}
+def GMIR_UAddEOp : GMIR_AddSubCarryOp<"uadde"> {
+  let arguments = (ins GMIR_LLTType:$lhs, GMIR_LLTType:$rhs, GMIR_LLTType:$carryIn);
+}
+def GMIR_USubOOp : GMIR_AddSubCarryOp<"usubo"> {
+  let arguments = (ins GMIR_LLTType:$lhs, GMIR_LLTType:$rhs);
+}
+def GMIR_USubEOp : GMIR_AddSubCarryOp<"usube"> {
+  let arguments = (ins GMIR_LLTType:$lhs, GMIR_LLTType:$rhs, GMIR_LLTType:$carryIn);
+}
+
+def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
+  let summary = "Splits a scalar into narrower pieces, mirroring G_UNMERGE_VALUES";
+  let description = [{
+    Emitted only by GMIRLegalizer's NarrowScalarAddSubPattern, to split a
+    too-wide operand into `dsts.size()` contiguous narrower pieces before
+    feeding them to a chain of `gmir.uaddo`/`gmir.uadde` (or usubo/usube).
+    `hasVerifier = 1`: no stock ODS trait fits ("all *results* share one
+    type" isn't a built-in trait, and `src`'s type legitimately differs
+    from `dsts`'s, ruling out `SameOperandsAndResultType`), so
+    `UnmergeOp::verify()` in GMIRDialect.cpp checks it by hand.
+  }];
+  let arguments = (ins GMIR_LLTType:$src);
+  let results = (outs Variadic<GMIR_LLTType>:$dsts);
+  let hasVerifier = 1;
+}
+
+def GMIR_MergeOp : GMIR_Op<"merge", [Pure]> {
+  let summary = "Concatenates narrow pieces into a scalar, mirroring G_MERGE_VALUES";
+  let description = [{
+    Inverse of `gmir.unmerge`: reassembles a NarrowScalarAddSubPattern's
+    per-piece `gmir.uaddo`/`gmir.uadde` (or usubo/usube) results back into
+    the original wider `!gmir.llt`. See `gmir.unmerge` for why
+    `hasVerifier = 1` is needed here too (checking `srcs` all share one
+    type).
+  }];
+  let arguments = (ins Variadic<GMIR_LLTType>:$srcs);
+  let results = (outs GMIR_LLTType:$dst);
+  let hasVerifier = 1;
 }
 
 def GMIR_CallOp : GMIR_Op<"call"> {

@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "GMIRImporter.h"
+#include "GMIRLegalizer.h"
 #include "IR/GMIRDialect.h"
 #include "MLIRToGMIRTranslator.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -37,8 +38,21 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/StackProtector.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
+
+// M4 slice 1's proof mechanism (see GMIRLegalizer.h): the permanent
+// downstream target Legalizer MachineFunctionPass makes the asm-diff
+// oracle alone unable to distinguish "GMIRLegalizer's own pattern ran" from
+// "the safety-net pass quietly did the work instead" for any correctly-
+// scoped legalization slice. Dumping the gmir IR right after legalize(),
+// before translation, lets a FileCheck test grep for the ops (e.g.
+// gmir.uaddo/uadde/merge/unmerge) that only GMIRLegalizer's patterns emit.
+static cl::opt<bool> PrintGMIRAfterLegalize(
+    "print-gmir-after-legalize", cl::Hidden,
+    cl::desc("Print the gmir IR right after GMIRLegalizer runs, before "
+             "MLIRToGMIRTranslator lowers it to real MIR"));
 
 namespace {
 // Deliberately skips the usual INITIALIZE_PASS/PassRegistry registration:
@@ -113,10 +127,19 @@ public:
           TPC.getCSEConfig());
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
-    if (!FuncOp ||
-        !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
-      // Outside M1's supported subset, or CallLowering itself declined:
-      // defer to the existing selector, same as always.
+    if (!FuncOp || !gmir::legalize(FuncOp, MF)) {
+      // Outside the supported subset: defer to the existing selector, same
+      // as always.
+      MF.getProperties().setFailedISel();
+      return false;
+    }
+
+    if (PrintGMIRAfterLegalize)
+      FuncOp.print(llvm::errs());
+
+    if (!gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
+      // CallLowering itself declined: defer to the existing selector, same
+      // as always.
       MF.getProperties().setFailedISel();
       return false;
     }
