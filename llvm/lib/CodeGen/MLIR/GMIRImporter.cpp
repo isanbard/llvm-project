@@ -329,10 +329,23 @@ private:
     gmir::LLTType ResTy = convertType(Context, AI.getType());
     if (!ResTy)
       return false;
+    // getAllocationSize returns nullopt not just for a non-constant array
+    // size (already excluded by isStaticAlloca() above), but also when
+    // arraySize*elementSize itself overflows uint64_t (checkedMulUnsigned
+    // inside it) -- e.g. `alloca i64, i64 4611686018427387905`. Reject
+    // that explicitly rather than defaulting to TypeSize::getZero(): the
+    // old code's `.value_or(TypeSize::getZero())` treated an overflowed,
+    // astronomically-large allocation the same as a genuine zero-size one,
+    // silently under-sizing the real stack object to 1 byte via the
+    // clamp below -- the same silent-under-sizing bug class the adjacent
+    // scalable-type check above already guards against, just via a
+    // different trigger.
+    std::optional<TypeSize> Size = AI.getAllocationSize(*DL);
+    if (!Size)
+      return false;
     // Matches IRTranslator::getOrCreateFrameIndex: always allocate at least
     // one byte.
-    TypeSize Size = AI.getAllocationSize(*DL).value_or(TypeSize::getZero());
-    uint64_t SizeBytes = std::max<uint64_t>(Size.getKnownMinValue(), 1);
+    uint64_t SizeBytes = std::max<uint64_t>(Size->getKnownMinValue(), 1);
     auto Op = gmir::AllocaOp::create(
         Builder, Builder.getUnknownLoc(), ResTy,
         Builder.getI64IntegerAttr(SizeBytes),

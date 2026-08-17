@@ -336,6 +336,13 @@ private:
       return true;
     }
 
+    // gmir.build_vector -> G_BUILD_VECTOR, and gmir.anyext/trunc ->
+    // G_ANYEXT/G_TRUNC: like gmir.uaddo/unmerge above, emitted only by
+    // GMIRLegalizer (FewerElementsScalarizePattern and WidenScalarPattern
+    // respectively), never by GMIRImporter directly -- must be handled
+    // here for the same reason: skipping them would silently defeat
+    // those patterns by falling back to the legacy selector instead of
+    // translating their output.
     if (auto BuildVector = dyn_cast<gmir::BuildVectorOp>(&Op)) {
       SmallVector<Register, 4> SrcRegs;
       for (mlir::Value Src : BuildVector.getSrcs())
@@ -432,8 +439,11 @@ private:
     if (auto Call = dyn_cast<gmir::CallOp>(&Op))
       return translateCall(Call);
 
-    // GMIRImporter only ever emits the ops handled above (plus
-    // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
+    // Every op this translator can produce real MIR for is handled above
+    // (plus func::ReturnOp/gmir.br/gmir.brcond, handled directly in
+    // run()) -- some only ever emitted by GMIRImporter, others only ever
+    // emitted by GMIRLegalizer (see the gmir.uaddo/unmerge/build_vector/
+    // anyext comments above), never both. Nothing else is expected.
     return false;
   }
 
@@ -464,8 +474,15 @@ private:
     // Regroup the flat leaf-operand list back into one ArrayRef<Register>
     // per original IR argument, using argLeafCounts. CallArgRegStorage
     // provides stable storage for the ArrayRef<Register>s in ArgRegs,
-    // matching lowerFormalArguments's ArgRegStorage pattern.
+    // matching lowerFormalArguments's ArgRegStorage pattern -- including
+    // its reserve() call: without it, a call with more than 8 original
+    // arguments would grow CallArgRegStorage past its inline capacity
+    // mid-loop, move-relocating every already-pushed inner SmallVector
+    // (including any still using ITS OWN inline storage, i.e. every
+    // single-leaf-register argument) and dangling the ArrayRef<Register>s
+    // already captured into ArgRegs for those earlier arguments.
     SmallVector<SmallVector<Register, 1>, 8> CallArgRegStorage;
+    CallArgRegStorage.reserve(Call.getArgLeafCounts().size());
     SmallVector<ArrayRef<Register>, 8> ArgRegs;
     // Call.getArgs() (an mlir::OperandRange) already supports O(1) random
     // access -- indexed directly below rather than copied into a
