@@ -394,7 +394,16 @@ private:
       return false;
     llvm::Type *PtrIRTy = LI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+    // Unlike PtrTy (pointers always convert successfully -- convertType
+    // has no width restriction for them), the pointer's index type is an
+    // *integer* whose width is datalayout-defined, not statically
+    // bounded, so it can hit convertType's >64-bit rejection on an
+    // unusual custom datalayout (e.g. `p:128:128`). Bail like every
+    // other convertType-consuming path in this file, rather than handing
+    // a null type to gmir op construction below.
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    if (!OffsetTy)
+      return false;
     // Mirrors TargetLoweringBase::getLoadMemOperandFlags's MOInvariant/
     // MONonTemporal derivation exactly -- see gmir.load's doc comment for
     // why MODereferenceable isn't modeled alongside these.
@@ -438,7 +447,12 @@ private:
       return false;
     llvm::Type *PtrIRTy = SI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+    // See importLoad's identical check above for why OffsetTy (unlike
+    // PtrTy) needs one -- its width is datalayout-defined, not
+    // statically bounded.
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    if (!OffsetTy)
+      return false;
     // Mirrors TargetLoweringBase::getStoreMemOperandFlags's MONonTemporal
     // derivation exactly.
     mlir::UnitAttr IsNonTemporal = SI.hasMetadata(LLVMContext::MD_nontemporal)
@@ -519,7 +533,14 @@ private:
 
     llvm::Type *OffsetIRTy = DL->getIndexType(GEP.getPointerOperandType());
     unsigned IndexBitWidth = OffsetIRTy->getIntegerBitWidth();
+    // See importLoad's identical check for why this can be null on an
+    // unusual custom datalayout (a >64-bit pointer-index type) --
+    // convertType's width restriction applies to any integer type, and
+    // the index type here is derived from the datalayout, not statically
+    // bounded the way IndexBitWidth's own use above might suggest.
     gmir::LLTType OffsetTy = convertType(Context, OffsetIRTy);
+    if (!OffsetTy)
+      return false;
 
     bool NoUWrap = GEPOp.hasNoUnsignedWrap();
     bool NoUSWrap = GEPOp.hasNoUnsignedSignedWrap();

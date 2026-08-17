@@ -126,6 +126,25 @@ unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
   return {LhsParts, RhsParts};
 }
 
+/// Shared constructor/member boilerplate for every gmir-level
+/// legalization pattern below: each needs a GMIRLegalizerInfoAdapter and
+/// a DataLayout reference, and an identical 3-line constructor
+/// forwarding to OpRewritePattern<OpTy>. Factored into one base (rather
+/// than left duplicated across all 5 pattern classes) so a future change
+/// to what shared state these patterns carry only needs one edit.
+template <typename OpTy>
+class GMIRLegalizePatternBase : public OpRewritePattern<OpTy> {
+public:
+  GMIRLegalizePatternBase(MLIRContext *Context,
+                          GMIRLegalizerInfoAdapter Adapter,
+                          const llvm::DataLayout &DL)
+      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+
+protected:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+};
+
 /// Implements the single top-level `G_ADD`/`G_SUB` NarrowScalar action
 /// (LegalizerHelper::narrowScalarAddSub's exact hi/lo+carry split
 /// algorithm, ported to build gmir ops instead of real MIR): unmerge each
@@ -141,12 +160,13 @@ unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
 /// downstream target Legalizer pass, exactly as they would for real
 /// GlobalISel's own narrowScalarAddSub output.
 template <typename OpTy, typename CarryOOp, typename CarryEOp>
-class NarrowScalarAddSubPattern : public OpRewritePattern<OpTy> {
+class NarrowScalarAddSubPattern : public GMIRLegalizePatternBase<OpTy> {
+  using Base = GMIRLegalizePatternBase<OpTy>;
+  using Base::Adapter;
+  using Base::DL;
+
 public:
-  NarrowScalarAddSubPattern(MLIRContext *Context,
-                            GMIRLegalizerInfoAdapter Adapter,
-                            const llvm::DataLayout &DL)
-      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+  using Base::Base;
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
@@ -185,10 +205,6 @@ public:
     Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
     return success();
   }
-
-private:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
 };
 
 /// Implements LegalizerHelper::narrowScalarBasic's algorithm for
@@ -199,12 +215,13 @@ private:
 /// pieces directly. Shares getExactNarrowScalarSplit's guard logic with
 /// NarrowScalarAddSubPattern.
 template <typename OpTy>
-class NarrowScalarBitwisePattern : public OpRewritePattern<OpTy> {
+class NarrowScalarBitwisePattern : public GMIRLegalizePatternBase<OpTy> {
+  using Base = GMIRLegalizePatternBase<OpTy>;
+  using Base::Adapter;
+  using Base::DL;
+
 public:
-  NarrowScalarBitwisePattern(MLIRContext *Context,
-                             GMIRLegalizerInfoAdapter Adapter,
-                             const llvm::DataLayout &DL)
-      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+  using Base::Base;
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
@@ -232,27 +249,32 @@ public:
     Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
     return success();
   }
-
-private:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
 };
 
 /// Implements LegalizerHelper::narrowScalarMul/multiplyRegisters's
-/// algorithm for gmir.mul, specialized to the only case gmir can ever
-/// reach: an exact 2-limb split (GMIRImporter.cpp's 64-bit integer cap
-/// means NumParts > 2 never occurs in practice). At NumParts == 2,
-/// multiplyRegisters's loop only ever executes its last-limb branch
-/// once, needing no carry-propagation op at all -- just the schoolbook
-/// 3-multiply/2-add shape: Lo = ALo*BLo (kept as-is, mod 2^NarrowBits);
-/// Hi = umulh(ALo,BLo) + ALo*BHi + AHi*BLo (each cross term's own
-/// overflow beyond NarrowBits is discarded, matching plain integer
-/// multiplication's mod-2^64 semantics for the full result).
-class NarrowScalarMulPattern : public OpRewritePattern<gmir::MulOp> {
+/// algorithm for gmir.mul, but only the NumParts == 2 case: at exactly 2
+/// limbs, multiplyRegisters's loop only ever executes its last-limb
+/// branch once, needing no carry-propagation op at all -- just the
+/// schoolbook 3-multiply/2-add shape: Lo = ALo*BLo (kept as-is, mod
+/// 2^NarrowBits); Hi = umulh(ALo,BLo) + ALo*BHi + AHi*BLo (each cross
+/// term's own overflow beyond NarrowBits is discarded, matching plain
+/// integer multiplication's mod-2^64 semantics for the full result).
+/// Every NumParts==2 case is empirically confirmed to be the only one
+/// gmir.mul's NarrowScalar action ever produces today (i686's G_MUL
+/// clamps s64 straight to s32, a single 2-limb split) -- but that's a
+/// fact about the one target rule this has been checked against, not a
+/// structural guarantee from GMIRImporter's 64-bit integer cap (which
+/// bounds the *source* type's width, not what step size a target's
+/// LegalizerInfo::getAction chooses to narrow by). matchAndRewrite below
+/// bails explicitly on any other NumParts rather than assuming this
+/// can't happen.
+class NarrowScalarMulPattern : public GMIRLegalizePatternBase<gmir::MulOp> {
+  using Base = GMIRLegalizePatternBase<gmir::MulOp>;
+  using Base::Adapter;
+  using Base::DL;
+
 public:
-  NarrowScalarMulPattern(MLIRContext *Context, GMIRLegalizerInfoAdapter Adapter,
-                         const llvm::DataLayout &DL)
-      : OpRewritePattern<gmir::MulOp>(Context), Adapter(Adapter), DL(DL) {}
+  using Base::Base;
 
   LogicalResult matchAndRewrite(gmir::MulOp Op,
                                 PatternRewriter &Rewriter) const override {
@@ -263,9 +285,12 @@ public:
     if (!Split)
       return failure();
     auto [NarrowTy, NumParts] = *Split;
-    // Only the 2-limb case is implemented -- confirmed unreachable
-    // otherwise given GMIRImporter's 64-bit integer cap, but bail
-    // explicitly rather than mishandle a hypothetical wider split.
+    // Only the 2-limb case is implemented (see the class doc comment for
+    // why NumParts other than 2 is a real, if so-far-unobserved,
+    // possibility rather than something the importer's type cap rules
+    // out) -- bail explicitly rather than mishandle it, same
+    // fail-closed-to-the-real-downstream-Legalizer discipline as every
+    // other unhandled case in this file.
     if (NumParts != 2)
       return failure();
 
@@ -292,10 +317,6 @@ public:
     Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
     return success();
   }
-
-private:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
 };
 
 /// Implements the single WidenScalar action shared verbatim by
@@ -309,11 +330,13 @@ private:
 /// bookkeeping at all: exactly one any-extend per operand, one op, one
 /// truncate.
 template <typename OpTy>
-class WidenScalarPattern : public OpRewritePattern<OpTy> {
+class WidenScalarPattern : public GMIRLegalizePatternBase<OpTy> {
+  using Base = GMIRLegalizePatternBase<OpTy>;
+  using Base::Adapter;
+  using Base::DL;
+
 public:
-  WidenScalarPattern(MLIRContext *Context, GMIRLegalizerInfoAdapter Adapter,
-                     const llvm::DataLayout &DL)
-      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+  using Base::Base;
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
@@ -335,10 +358,6 @@ public:
     Rewriter.replaceOpWithNewOp<gmir::TruncOp>(Op, DstGTy, WideRes.getResult());
     return success();
   }
-
-private:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
 };
 
 /// Implements LegalizerHelper::fewerElementsVectorMultiEltType's pure-
@@ -357,12 +376,13 @@ private:
 /// Legalizer, same graceful-fallback discipline as every unhandled
 /// action).
 template <typename OpTy>
-class FewerElementsScalarizePattern : public OpRewritePattern<OpTy> {
+class FewerElementsScalarizePattern : public GMIRLegalizePatternBase<OpTy> {
+  using Base = GMIRLegalizePatternBase<OpTy>;
+  using Base::Adapter;
+  using Base::DL;
+
 public:
-  FewerElementsScalarizePattern(MLIRContext *Context,
-                                GMIRLegalizerInfoAdapter Adapter,
-                                const llvm::DataLayout &DL)
-      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+  using Base::Base;
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
@@ -390,10 +410,6 @@ public:
     Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
     return success();
   }
-
-private:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
 };
 
 } // namespace
@@ -401,7 +417,8 @@ private:
 const FrozenRewritePatternSet &
 gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
                                  const llvm::DataLayout &DL) {
-  auto It = Cache.find(LI);
+  auto Key = std::make_pair(LI, &DL);
+  auto It = Cache.find(Key);
   if (It != Cache.end())
     return It->second;
 
@@ -435,7 +452,7 @@ gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
   Patterns.add<FewerElementsScalarizePattern<gmir::MulOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
 
-  return Cache.try_emplace(LI, std::move(Patterns)).first->second;
+  return Cache.try_emplace(Key, std::move(Patterns)).first->second;
 }
 
 bool gmir::legalize(func::FuncOp FuncOp, MachineFunction &MF,

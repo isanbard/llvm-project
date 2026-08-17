@@ -462,8 +462,19 @@ private:
   bool translateCall(gmir::CallOp Call) {
     auto *CI = mlir::OpaqueLoc::getUnderlyingLocationOrNull<llvm::CallInst *>(
         Call.getLoc());
-    assert(CI && "gmir.call must carry its originating llvm::CallInst via "
-                 "OpaqueLoc -- see GMIRImporter.cpp's importCall");
+    // Every gmir.call GMIRImporter ever produces carries this by
+    // construction (see importCall), so this "should" always be
+    // non-null -- but unlike everywhere else in this file that assumes
+    // an invariant impossible to violate today, a future legalizer
+    // pattern or rewriter helper cloning/rebuilding a gmir.call could
+    // plausibly drop the OpaqueLoc without anyone noticing at the type
+    // level. A real check-and-bail costs nothing here and keeps this
+    // path inside the same "never crash, always fall back gracefully"
+    // discipline every other unsupported-construct path in this file
+    // follows, instead of being the one place that only holds in debug
+    // builds.
+    if (!CI)
+      return false;
 
     SmallVector<Register, 1> ResRegs;
     if (Call.getNumResults() == 1) {

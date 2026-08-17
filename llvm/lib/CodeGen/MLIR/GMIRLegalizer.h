@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "llvm/ADT/DenseMap.h"
+#include <utility>
 
 namespace llvm {
 class DataLayout;
@@ -38,18 +39,26 @@ class MachineFunction;
 namespace gmir {
 
 /// Caches the FrozenRewritePatternSet gmir::legalize() builds, keyed by
-/// the target LegalizerInfo the patterns were built to query -- every
-/// function sharing one target (the normal single-target-per-module case)
-/// reuses the same pattern set instead of rebuilding/refreezing it per
-/// function. Meant to be owned as long-lived state by the caller (e.g. a
-/// MachineFunctionPass member -- one pass instance per compilation
-/// thread/pipeline in any parallel-codegen configuration, so this class
-/// needs no locking of its own). Safe to cache across functions only
-/// because the patterns' captured MLIRContext*/DataLayout&/LegalizerInfo*
-/// are themselves already long-lived (see MLIRInstructionSelect.cpp: one
-/// MLIRContext per pass instance, not one per function; DataLayout/
-/// LegalizerInfo are owned by the Module/TargetSubtargetInfo, which
-/// outlive any single MachineFunctionPass invocation).
+/// the (LegalizerInfo, DataLayout) pair the patterns were built to query
+/// -- every function sharing one target *and* one Module (the normal
+/// single-target-per-invocation case) reuses the same pattern set instead
+/// of rebuilding/refreezing it per function. Meant to be owned as
+/// long-lived state by the caller (e.g. a MachineFunctionPass member --
+/// one pass instance per compilation thread/pipeline in any
+/// parallel-codegen configuration, so this class needs no locking of its
+/// own). Safe to cache across functions only because the patterns'
+/// captured MLIRContext*/DataLayout&/LegalizerInfo* are themselves
+/// already long-lived (see MLIRInstructionSelect.cpp: one MLIRContext per
+/// pass instance, not one per function; DataLayout/LegalizerInfo are
+/// owned by the Module/TargetSubtargetInfo, which outlive any single
+/// MachineFunctionPass invocation). Keyed on *both* pointers, not just
+/// LegalizerInfo: a single long-lived pass instance processing more than
+/// one Module in sequence (not possible via plain `llc`, one Module per
+/// invocation, but a real risk for any embedding -- e.g. a JIT/service --
+/// that recycles one codegen pipeline across Modules sharing one
+/// subtarget) could otherwise hit a cache entry whose patterns still
+/// capture a *different*, possibly-already-destroyed Module's
+/// DataLayout.
 class LegalizerPatternCache {
 public:
   const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context,
@@ -57,7 +66,9 @@ public:
                                            const llvm::DataLayout &DL);
 
 private:
-  llvm::DenseMap<const LegalizerInfo *, mlir::FrozenRewritePatternSet> Cache;
+  llvm::DenseMap<std::pair<const LegalizerInfo *, const llvm::DataLayout *>,
+                 mlir::FrozenRewritePatternSet>
+      Cache;
 };
 
 /// Rewrites FuncOp in place. Returns false only on an unrecoverable error
