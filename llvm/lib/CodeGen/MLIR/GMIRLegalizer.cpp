@@ -238,6 +238,66 @@ private:
   const llvm::DataLayout &DL;
 };
 
+/// Implements LegalizerHelper::narrowScalarMul/multiplyRegisters's
+/// algorithm for gmir.mul, specialized to the only case gmir can ever
+/// reach: an exact 2-limb split (GMIRImporter.cpp's 64-bit integer cap
+/// means NumParts > 2 never occurs in practice). At NumParts == 2,
+/// multiplyRegisters's loop only ever executes its last-limb branch
+/// once, needing no carry-propagation op at all -- just the schoolbook
+/// 3-multiply/2-add shape: Lo = ALo*BLo (kept as-is, mod 2^NarrowBits);
+/// Hi = umulh(ALo,BLo) + ALo*BHi + AHi*BLo (each cross term's own
+/// overflow beyond NarrowBits is discarded, matching plain integer
+/// multiplication's mod-2^64 semantics for the full result).
+class NarrowScalarMulPattern : public OpRewritePattern<gmir::MulOp> {
+public:
+  NarrowScalarMulPattern(MLIRContext *Context, GMIRLegalizerInfoAdapter Adapter,
+                         const llvm::DataLayout &DL)
+      : OpRewritePattern<gmir::MulOp>(Context), Adapter(Adapter), DL(DL) {}
+
+  LogicalResult matchAndRewrite(gmir::MulOp Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    LLT DstTy = gmir::convertLLT(DstGTy, DL);
+    auto Split = getExactNarrowScalarSplit(
+        Adapter, getGenericOpcode<gmir::MulOp>(), DstTy);
+    if (!Split)
+      return failure();
+    auto [NarrowTy, NumParts] = *Split;
+    // Only the 2-limb case is implemented -- confirmed unreachable
+    // otherwise given GMIRImporter's 64-bit integer cap, but bail
+    // explicitly rather than mishandle a hypothetical wider split.
+    if (NumParts != 2)
+      return failure();
+
+    MLIRContext *Context = Rewriter.getContext();
+    gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+    Location Loc = Op.getLoc();
+    auto [LhsParts, RhsParts] =
+        unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
+    mlir::Value ALo = LhsParts.getDsts()[0];
+    mlir::Value AHi = LhsParts.getDsts()[1];
+    mlir::Value BLo = RhsParts.getDsts()[0];
+    mlir::Value BHi = RhsParts.getDsts()[1];
+
+    auto Lo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+    auto HiHi = gmir::UMulHOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+    auto LoHi = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BHi);
+    auto HiLo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, AHi, BLo);
+    auto Hi0 = gmir::AddOp::create(Rewriter, Loc, NarrowGTy, HiHi.getResult(),
+                                   LoHi.getResult());
+    auto Hi = gmir::AddOp::create(Rewriter, Loc, NarrowGTy, Hi0.getResult(),
+                                  HiLo.getResult());
+
+    SmallVector<mlir::Value, 2> DstParts{Lo.getResult(), Hi.getResult()};
+    Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+    return success();
+  }
+
+private:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+};
+
 /// Implements the single WidenScalar action shared verbatim by
 /// `G_ADD`/`G_AND`/`G_MUL`/`G_OR`/`G_XOR`/`G_SUB`
 /// (LegalizerHelper.cpp's widenScalar switch: any-extend both operands to
@@ -358,6 +418,8 @@ gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<NarrowScalarBitwisePattern<gmir::XorOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<NarrowScalarMulPattern>(&Context, GMIRLegalizerInfoAdapter(LI),
+                                       DL);
   Patterns.add<WidenScalarPattern<gmir::AddOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<WidenScalarPattern<gmir::SubOp>>(

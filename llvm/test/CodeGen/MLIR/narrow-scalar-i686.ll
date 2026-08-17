@@ -37,6 +37,18 @@
 ; unlike add/sub, there's no carry to thread between chunks, so each
 ; narrow chunk pair gets the same op applied independently (gmir.unmerge ->
 ; gmir.and/or/xor x2 (no carry) -> gmir.merge).
+;
+; M4 slice 5 extends this file again with gmir.mul: deferred three times
+; (slices 1-3) as "materially more complex" (LegalizerHelper::
+; narrowScalarMul/multiplyRegisters is a full N-limb schoolbook multiply
+; with carry propagation), but GMIRImporter.cpp's 64-bit integer cap means
+; gmir can only ever reach the NumParts==2 case, where multiplyRegisters's
+; loop only executes its last-limb branch once -- no carry op needed at
+; all, just 3 multiplies and 2 adds (gmir.unmerge x2 -> gmir.mul/gmir.umulh/
+; gmir.mul/gmir.mul -> gmir.add x2 -> gmir.merge). X86LegalizerInfo.cpp:
+; 213-231's G_MUL clamps to sMaxScalar (s32 on i686, since Is64Bit=false),
+; so s64 mul resolves to NarrowScalar(s32) here too, same as the other five
+; ops above.
 
 define i64 @add64(i64 %a, i64 %b) {
 entry:
@@ -96,4 +108,20 @@ entry:
 ; CHECK: "gmir.unmerge"
 ; CHECK: gmir.xor
 ; CHECK: gmir.xor
+; CHECK: "gmir.merge"
+
+define i64 @mul64(i64 %a, i64 %b) {
+entry:
+  %c = mul i64 %a, %b
+  ret i64 %c
+}
+; CHECK-LABEL: func.func @mul64
+; CHECK: "gmir.unmerge"
+; CHECK: "gmir.unmerge"
+; CHECK: gmir.mul
+; CHECK: gmir.umulh
+; CHECK: gmir.mul
+; CHECK: gmir.mul
+; CHECK: gmir.add
+; CHECK: gmir.add
 ; CHECK: "gmir.merge"

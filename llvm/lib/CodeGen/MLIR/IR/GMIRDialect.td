@@ -74,6 +74,7 @@ class GMIR_BinOp<string mnemonic, list<Trait> traits = []>
 }
 
 def GMIR_AddOp  : GMIR_BinOp<"add",  [Commutative]>;
+def GMIR_UMulHOp : GMIR_BinOp<"umulh", [Commutative]>;
 def GMIR_SubOp  : GMIR_BinOp<"sub">;
 def GMIR_MulOp  : GMIR_BinOp<"mul",  [Commutative]>;
 def GMIR_SDivOp : GMIR_BinOp<"sdiv">;

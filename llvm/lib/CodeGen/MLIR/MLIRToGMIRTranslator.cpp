@@ -245,6 +245,7 @@ private:
     return true;                                                               \
   }
     GMIR_BINOP_CASE(AddOp, MIRBuilder.buildAdd(Ty, LHS, RHS))
+    GMIR_BINOP_CASE(UMulHOp, MIRBuilder.buildUMulH(Ty, LHS, RHS))
     GMIR_BINOP_CASE(SubOp, MIRBuilder.buildSub(Ty, LHS, RHS))
     GMIR_BINOP_CASE(MulOp, MIRBuilder.buildMul(Ty, LHS, RHS))
     GMIR_BINOP_CASE(AndOp, MIRBuilder.buildAnd(Ty, LHS, RHS))
