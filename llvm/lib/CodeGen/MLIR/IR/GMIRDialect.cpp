@@ -137,6 +137,20 @@ LogicalResult UnmergeOp::verify() {
   auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
   if (Ty.getScalarSizeInBits() == 0 || SrcTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  if (Ty.getNumElements() != 0)
+    return emitOpError("results must be scalar");
+  // Two distinct shapes, both real G_UNMERGE_VALUES uses (see the op's
+  // doc comment): a vector source splits into its per-element scalar
+  // lanes (count-based -- each dst is one element, not a bit-width
+  // fraction), while a scalar source splits into narrower bit-width
+  // chunks (the original, sum-based check).
+  if (SrcTy.getNumElements() != 0) {
+    if (SrcTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
+      return emitOpError("results must match the operand's element width");
+    if (SrcTy.getNumElements() != getDsts().size())
+      return emitOpError("result count must match the operand's element count");
+    return success();
+  }
   if (SrcTy.getScalarSizeInBits() !=
       Ty.getScalarSizeInBits() * getDsts().size())
     return emitOpError("result bit widths must sum to the operand's width");
@@ -156,6 +170,30 @@ LogicalResult MergeOp::verify() {
   if (DstTy.getScalarSizeInBits() !=
       Ty.getScalarSizeInBits() * getSrcs().size())
     return emitOpError("operand bit widths must sum to the result's width");
+  return success();
+}
+
+// Hand-written verifier for GMIR_BuildVectorOp (`hasVerifier = 1` in
+// GMIRDialect.td -- see its doc comment for why this is a distinct op
+// from gmir.merge rather than a shared one): checks the count- and
+// element-width-based relationship a vector build depends on, the
+// vector-lane analogue of MergeOp::verify()'s bit-width-sum check above.
+LogicalResult BuildVectorOp::verify() {
+  if (getSrcs().empty())
+    return emitOpError("expected at least one operand");
+  auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
+  for (mlir::Value Src : getSrcs().drop_front())
+    if (Src.getType() != Ty)
+      return emitOpError("all operands must have the same type");
+  auto DstTy = cast<gmir::LLTType>(getDst().getType());
+  if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (Ty.getNumElements() != 0)
+    return emitOpError("operands must be scalar");
+  if (DstTy.getNumElements() != getSrcs().size())
+    return emitOpError("result element count must match the operand count");
+  if (DstTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
+    return emitOpError("result element width must match the operands' width");
   return success();
 }
 

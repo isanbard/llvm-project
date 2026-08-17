@@ -335,6 +335,18 @@ private:
       return true;
     }
 
+    if (auto BuildVector = dyn_cast<gmir::BuildVectorOp>(&Op)) {
+      SmallVector<Register, 4> SrcRegs;
+      for (mlir::Value Src : BuildVector.getSrcs())
+        SrcRegs.push_back(ValueToReg.lookup(Src));
+      LLT Ty = convertLLT(
+          cast<gmir::LLTType>(BuildVector.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildBuildVector(Res, SrcRegs);
+      ValueToReg[BuildVector.getResult()] = Res;
+      return true;
+    }
+
     if (auto AnyExt = dyn_cast<gmir::AnyExtOp>(&Op)) {
       Register SrcReg = ValueToReg.lookup(AnyExt.getSrc());
       LLT Ty =

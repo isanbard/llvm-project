@@ -39,7 +39,21 @@ namespace gmir {
 // tablegen patterns don't match (they require isInteger() specifically)
 // while X86's happened to be permissive enough not to care -- every gmir
 // integer value must use LLT::integer(), not LLT::scalar().
+//
+// M4 slice 4 adds fixed-width integer vectors (!gmir.llt's numElements > 0)
+// to both directions below. The same INTEGER-vs-ANY_SCALAR trap applies to
+// vectors: LLT has an `LLT::fixed_vector(unsigned NumElements, unsigned
+// ScalarSizeInBits)` overload that internally calls LLT::scalar(),
+// producing the generic Kind::VECTOR_ANY -- silently wrong for the same
+// AArch64-pattern-matching reason as the scalar case above. Always use the
+// `LLT ScalarTy`-taking overload (`LLT::vector(ElementCount, LLT
+// ScalarTy)` or `LLT::fixed_vector(unsigned, LLT ScalarTy)`, both
+// equivalent) with an explicit `LLT::integer(N)` element type, never the
+// bit-width-only overload.
 inline LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
+  if (Ty.getNumElements() != 0)
+    return LLT::vector(ElementCount::getFixed(Ty.getNumElements()),
+                       LLT::integer(Ty.getScalarSizeInBits()));
   if (Ty.getScalarSizeInBits() == 0)
     return LLT::pointer(Ty.getAddressSpace(),
                         DL.getPointerSizeInBits(Ty.getAddressSpace()));
@@ -49,10 +63,15 @@ inline LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
 /// Inverse of convertLLT: builds the !gmir.llt a real LLT would round-trip
 /// to. Used by GMIRLegalizer.cpp to turn a target LegalizerInfo's LLT-typed
 /// answer (e.g. NarrowScalar's LegalizeActionStep::NewType) back into a
-/// !gmir.llt for building new gmir ops. Only scalar/pointer LLTs occur here
-/// (mirrors convertLLT's own scope) -- vectors are out of scope for the
-/// whole gmir dialect so far.
+/// !gmir.llt for building new gmir ops. Scalar, pointer, and (as of M4
+/// slice 4) fixed-width integer-vector LLTs occur here -- scalable vectors
+/// and vector-of-pointer remain out of scope for the whole gmir dialect,
+/// matching convertType's (GMIRImporter.cpp) import-side scope.
 inline gmir::LLTType convertToGMIRType(mlir::MLIRContext &Context, LLT Ty) {
+  if (Ty.isVector())
+    return gmir::LLTType::get(&Context, Ty.getScalarSizeInBits(),
+                              Ty.getNumElements(), /*addressSpace=*/0,
+                              /*isScalable=*/false);
   if (Ty.isPointer())
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, Ty.getAddressSpace(),

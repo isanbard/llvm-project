@@ -103,13 +103,17 @@ getExactNarrowScalarSplit(const GMIRLegalizerInfoAdapter &Adapter,
 }
 
 /// Unmerges Op's lhs/rhs operands into NumParts NarrowGTy-typed pieces
-/// each. The common first step of both NarrowScalarAddSubPattern's and
-/// NarrowScalarBitwisePattern's rewrites -- they diverge only afterward,
-/// on how the per-chunk op sequence composes (carry-chained vs.
-/// independent). Factored out so a future fix to this step (e.g. general
-/// non-exact-multiple leftover handling, currently out of scope -- see
-/// getExactNarrowScalarSplit) only needs to change one place, not one
-/// per NarrowScalar pattern.
+/// each. The common first step of NarrowScalarAddSubPattern's,
+/// NarrowScalarBitwisePattern's, and FewerElementsScalarizePattern's
+/// rewrites -- they diverge only afterward, on how the per-piece op
+/// sequence composes (carry-chained, independent-chunk, or independent-
+/// lane) and on what NarrowGTy/NumParts mean (narrower bit-width chunks
+/// for the first two, vector lanes for the third -- gmir.unmerge's
+/// verifier distinguishes the two by the source operand's own shape, see
+/// GMIRDialect.cpp). Factored out so a future fix to this step (e.g.
+/// general non-exact-multiple leftover handling, currently out of scope
+/// -- see getExactNarrowScalarSplit) only needs to change one place, not
+/// one per pattern.
 template <typename OpTy>
 std::pair<gmir::UnmergeOp, gmir::UnmergeOp>
 unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
@@ -277,6 +281,61 @@ private:
   const llvm::DataLayout &DL;
 };
 
+/// Implements LegalizerHelper::fewerElementsVectorMultiEltType's pure-
+/// scalarize case (LegalizerHelper.cpp:5243-5310, reached via the
+/// G_ADD/G_MUL/etc. case block at 5691-5816): unmerge each vector operand
+/// into its scalar lanes, reapply OpTy per lane, reassemble via
+/// gmir.build_vector (mirrors G_BUILD_VECTOR, the real opcode
+/// buildMergeLikeInstr picks for a vector destination with scalar
+/// sources -- not G_MERGE_VALUES, which is scalar-dest-only). Bails when
+/// Step.NewType is still a vector: LegalizeMutations::scalarize's real
+/// implementation (`{TypeIdx, Query.Types[TypeIdx].getElementType()}`)
+/// always returns a bare scalar for pure scalarize, so a still-vector
+/// NewType means this is FewerElements's other flavor -- splitting into a
+/// narrower multi-element sub-vector, not full scalarization -- which is
+/// explicitly out of scope for this pattern (left to the real downstream
+/// Legalizer, same graceful-fallback discipline as every unhandled
+/// action).
+template <typename OpTy>
+class FewerElementsScalarizePattern : public OpRewritePattern<OpTy> {
+public:
+  FewerElementsScalarizePattern(MLIRContext *Context,
+                                GMIRLegalizerInfoAdapter Adapter,
+                                const llvm::DataLayout &DL)
+      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+
+  LogicalResult matchAndRewrite(OpTy Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    LLT DstTy = gmir::convertLLT(DstGTy, DL);
+    LegalizeActionStep Step =
+        Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
+    if (Step.Action != LegalizeActions::FewerElements ||
+        Step.NewType.isVector())
+      return failure();
+
+    MLIRContext *Context = Rewriter.getContext();
+    gmir::LLTType LaneGTy = gmir::convertToGMIRType(*Context, Step.NewType);
+    unsigned NumLanes = DstTy.getNumElements();
+    Location Loc = Op.getLoc();
+    auto [LhsParts, RhsParts] =
+        unmergeNarrowOperands(Rewriter, Op, Loc, LaneGTy, NumLanes);
+
+    SmallVector<mlir::Value, 4> DstParts;
+    for (unsigned I = 0; I != NumLanes; ++I) {
+      auto Lane = OpTy::create(Rewriter, Loc, LaneGTy, LhsParts.getDsts()[I],
+                               RhsParts.getDsts()[I]);
+      DstParts.push_back(Lane.getResult());
+    }
+    Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
+    return success();
+  }
+
+private:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+};
+
 } // namespace
 
 const FrozenRewritePatternSet &
@@ -310,6 +369,8 @@ gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
   Patterns.add<WidenScalarPattern<gmir::XorOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<WidenScalarPattern<gmir::MulOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<FewerElementsScalarizePattern<gmir::MulOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
 
   return Cache.try_emplace(LI, std::move(Patterns)).first->second;

@@ -290,18 +290,20 @@ def GMIR_USubEOp : GMIR_AddSubCarryOp<"usube"> {
 }
 
 def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
-  let summary = "Splits a scalar into narrower pieces, mirroring G_UNMERGE_VALUES";
+  let summary = "Splits a value into narrower pieces, mirroring G_UNMERGE_VALUES";
   let description = [{
-    Emitted only by GMIRLegalizer's NarrowScalar patterns
-    (NarrowScalarAddSubPattern and NarrowScalarBitwisePattern), to split a
-    too-wide operand into `dsts.size()` contiguous narrower pieces before
-    feeding them to a chain of `gmir.uaddo`/`gmir.uadde` (or usubo/usube),
-    or independently to `gmir.and`/`or`/`xor` (no carry -- see
-    NarrowScalarBitwisePattern), depending on which op is being narrowed.
-    `hasVerifier = 1`: no stock ODS trait fits ("all *results* share one
-    type" isn't a built-in trait, and `src`'s type legitimately differs
-    from `dsts`'s, ruling out `SameOperandsAndResultType`), so
-    `UnmergeOp::verify()` in GMIRDialect.cpp checks it by hand.
+    Two distinct uses, both emitted only by GMIRLegalizer, mirroring
+    G_UNMERGE_VALUES's own dual real-GlobalISel role: (1) NarrowScalar
+    patterns (NarrowScalarAddSubPattern, NarrowScalarBitwisePattern) split
+    a too-wide *scalar* operand into `dsts.size()` contiguous narrower
+    scalar pieces; (2) FewerElementsScalarizePattern splits a *vector*
+    operand into its `dsts.size()` scalar lanes (one dst per element, not
+    a bit-width split) before scalarizing a vector op. `UnmergeOp::verify()`
+    in GMIRDialect.cpp distinguishes the two by `src`'s shape and checks
+    each accordingly -- no stock ODS trait fits either case ("all
+    *results* share one type" isn't a built-in trait, and `src`'s type
+    legitimately differs from `dsts`'s, ruling out
+    `SameOperandsAndResultType`).
   }];
   let arguments = (ins GMIR_LLTType:$src);
   let results = (outs Variadic<GMIR_LLTType>:$dsts);
@@ -317,6 +319,27 @@ def GMIR_MergeOp : GMIR_Op<"merge", [Pure]> {
     NarrowScalarBitwisePattern) back into the original wider `!gmir.llt`.
     See `gmir.unmerge` for why `hasVerifier = 1` is needed here too
     (checking `srcs` all share one type).
+  }];
+  let arguments = (ins Variadic<GMIR_LLTType>:$srcs);
+  let results = (outs GMIR_LLTType:$dst);
+  let hasVerifier = 1;
+}
+
+def GMIR_BuildVectorOp : GMIR_Op<"build_vector", [Pure]> {
+  let summary = "Builds a vector from scalar elements, mirroring GlobalISel's G_BUILD_VECTOR";
+  let description = [{
+    Emitted only by GMIRLegalizer's FewerElementsScalarizePattern, to
+    reassemble a scalarized vector op's per-lane results into a single
+    vector. Distinct from `gmir.merge` (concatenates scalars into a wider
+    *scalar*, mirroring G_MERGE_VALUES): real GlobalISel itself uses a
+    different opcode here (MachineIRBuilder::getOpcodeForMerge picks
+    G_BUILD_VECTOR specifically for a vector destination with scalar
+    sources) -- mirrored 1:1 here rather than overloading `gmir.merge`'s
+    existing scalar-bit-concat verifier semantics onto a structurally
+    different operation. `hasVerifier = 1`: checks `srcs` all share one
+    non-pointer, non-vector type, and that `dst` is a fixed vector whose
+    element count matches `srcs.size()` and element width matches --
+    no stock ODS trait expresses this.
   }];
   let arguments = (ins Variadic<GMIR_LLTType>:$srcs);
   let results = (outs GMIR_LLTType:$dst);

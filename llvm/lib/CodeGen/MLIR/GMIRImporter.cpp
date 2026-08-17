@@ -15,6 +15,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/GlobalAlias.h"
@@ -30,11 +31,12 @@ using namespace mlir;
 
 namespace {
 
-/// Converts a scalar integer or pointer llvm::Type to !gmir.llt. Returns a
-/// null type for anything else (vectors, floats, aggregates) -- aggregates
-/// are handled by flattening to multiple leaf !gmir.llt values (see
-/// computeGMIRLeafTypes), not by this function; vectors/floats remain out
-/// of scope. Note: both `Value` and `Type` name distinct classes in ::llvm
+/// Converts a scalar integer, pointer, or fixed-width integer-vector
+/// llvm::Type to !gmir.llt. Returns a null type for anything else (floats,
+/// aggregates, scalable vectors, vector-of-pointer) -- aggregates are
+/// handled by flattening to multiple leaf !gmir.llt values (see
+/// computeGMIRLeafTypes), not by this function; the rest remain out of
+/// scope. Note: both `Value` and `Type` name distinct classes in ::llvm
 /// and ::mlir, so this file explicitly qualifies mlir::Value/mlir::Type/
 /// mlir::FunctionType throughout to avoid ambiguous lookups under the
 /// blanket `using namespace llvm;`/`using namespace mlir;` below.
@@ -60,6 +62,21 @@ gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, PtrTy->getAddressSpace(),
                               /*isScalable=*/false);
+  // Fixed-width integer vectors only (M4 slice 4's vector-scalarization
+  // scope): the plain `dyn_cast<llvm::IntegerType>` below already safely
+  // rejects vector-of-pointer (llvm::VectorType::isValidElementType
+  // permits `<N x ptr>`, but !gmir.llt has no notion of "vector of
+  // pointer" -- only scalarSizeInBits==0 means pointer, which a vector
+  // shape can't also express) and vector-of-float, without needing an
+  // explicit extra check.
+  if (auto *VecTy = dyn_cast<llvm::FixedVectorType>(Ty)) {
+    auto *EltTy = dyn_cast<llvm::IntegerType>(VecTy->getElementType());
+    if (!EltTy || EltTy->getBitWidth() > 64)
+      return {};
+    return gmir::LLTType::get(&Context, EltTy->getBitWidth(),
+                              VecTy->getNumElements(), /*addressSpace=*/0,
+                              /*isScalable=*/false);
+  }
   return {};
 }
 
