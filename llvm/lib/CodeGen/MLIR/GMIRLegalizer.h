@@ -27,19 +27,48 @@
 #define LLVM_CODEGEN_MLIR_GMIRLEGALIZER_H
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Rewrite/FrozenRewritePatternSet.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace llvm {
+class DataLayout;
+class LegalizerInfo;
 class MachineFunction;
 
 namespace gmir {
+
+/// Caches the FrozenRewritePatternSet gmir::legalize() builds, keyed by
+/// the target LegalizerInfo the patterns were built to query -- every
+/// function sharing one target (the normal single-target-per-module case)
+/// reuses the same pattern set instead of rebuilding/refreezing it per
+/// function. Meant to be owned as long-lived state by the caller (e.g. a
+/// MachineFunctionPass member -- one pass instance per compilation
+/// thread/pipeline in any parallel-codegen configuration, so this class
+/// needs no locking of its own). Safe to cache across functions only
+/// because the patterns' captured MLIRContext*/DataLayout&/LegalizerInfo*
+/// are themselves already long-lived (see MLIRInstructionSelect.cpp: one
+/// MLIRContext per pass instance, not one per function; DataLayout/
+/// LegalizerInfo are owned by the Module/TargetSubtargetInfo, which
+/// outlive any single MachineFunctionPass invocation).
+class LegalizerPatternCache {
+public:
+  const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context,
+                                           const LegalizerInfo *LI,
+                                           const llvm::DataLayout &DL);
+
+private:
+  llvm::DenseMap<const LegalizerInfo *, mlir::FrozenRewritePatternSet> Cache;
+};
 
 /// Rewrites FuncOp in place. Returns false only on an unrecoverable error
 /// (currently never -- ops this pass doesn't handle are simply left alone,
 /// not treated as failure, since the downstream Legalizer catches them);
 /// kept bool-returning to match GMIRImporter::importFunction/
 /// gmir::translate's fallible-step convention used throughout this
-/// pipeline's caller, MLIRInstructionSelect.cpp.
-bool legalize(mlir::func::FuncOp FuncOp, MachineFunction &MF);
+/// pipeline's caller, MLIRInstructionSelect.cpp. PatternCache is owned by
+/// the caller and reused across calls (see LegalizerPatternCache's doc).
+bool legalize(mlir::func::FuncOp FuncOp, MachineFunction &MF,
+              LegalizerPatternCache &PatternCache);
 
 } // namespace gmir
 } // namespace llvm

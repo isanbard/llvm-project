@@ -435,7 +435,10 @@ private:
     // matching lowerFormalArguments's ArgRegStorage pattern.
     SmallVector<SmallVector<Register, 1>, 8> CallArgRegStorage;
     SmallVector<ArrayRef<Register>, 8> ArgRegs;
-    SmallVector<mlir::Value, 8> Args(Call.getArgs());
+    // Call.getArgs() (an mlir::OperandRange) already supports O(1) random
+    // access -- indexed directly below rather than copied into a
+    // SmallVector first just to support that indexing.
+    mlir::OperandRange Args = Call.getArgs();
     unsigned FlatIdx = 0;
     for (int32_t Count : Call.getArgLeafCounts()) {
       SmallVector<Register, 1> Regs;

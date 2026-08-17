@@ -69,7 +69,19 @@ class MLIRInstructionSelect : public MachineFunctionPass {
 public:
   static char ID;
 
-  MLIRInstructionSelect() : MachineFunctionPass(ID) {}
+  // MLIRContext/dialect loading and the legalizer's pattern cache are
+  // pass-instance state, constructed once and reused across every
+  // runOnMachineFunction call (i.e. once per module, not once per
+  // function) -- a MachineFunctionPass instance is never shared across
+  // compilation threads in any parallel-codegen configuration, so no
+  // locking is needed for either. See GMIRLegalizer.h's
+  // LegalizerPatternCache doc for why this is also a correctness
+  // prerequisite for that cache (the cached patterns capture this
+  // Context by pointer).
+  MLIRInstructionSelect() : MachineFunctionPass(ID) {
+    Context.getOrLoadDialect<gmir::GMIRDialect>();
+    Context.getOrLoadDialect<mlir::func::FuncDialect>();
+  }
 
   StringRef getPassName() const override { return "MLIR Instruction Select"; }
 
@@ -100,14 +112,29 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    mlir::MLIRContext Context;
-    Context.getOrLoadDialect<gmir::GMIRDialect>();
-    Context.getOrLoadDialect<mlir::func::FuncDialect>();
-
     mlir::OwningOpRef<mlir::ModuleOp> Module(
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
     mlir::func::FuncOp FuncOp =
         gmir::importFunction(*Module, MF.getFunction());
+
+    if (!FuncOp || !gmir::legalize(FuncOp, MF, PatternCache)) {
+      // Outside the supported subset: defer to the existing selector, same
+      // as always.
+      MF.getProperties().setFailedISel();
+      return false;
+    }
+
+    if (PrintGMIRAfterLegalize) {
+      FuncOp.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+
+    // Everything below is only needed once import/legalization succeeded
+    // -- fetched here, after that check, rather than unconditionally up
+    // front, so a function outside the supported subset (the common case
+    // for real-world code today) doesn't pay for an unused BPI lookup, a
+    // TargetPassConfig analysis fetch, a CSE-config query, and
+    // createMIRBuilder's allocation before falling back.
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
 
     // Match IRTranslator::translate's own choice of builder exactly (see
@@ -127,18 +154,6 @@ public:
           TPC.getCSEConfig());
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
-    if (!FuncOp || !gmir::legalize(FuncOp, MF)) {
-      // Outside the supported subset: defer to the existing selector, same
-      // as always.
-      MF.getProperties().setFailedISel();
-      return false;
-    }
-
-    if (PrintGMIRAfterLegalize) {
-      FuncOp.print(llvm::errs());
-      llvm::errs() << '\n';
-    }
-
     if (!gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
       // CallLowering itself declined: defer to the existing selector, same
       // as always.
@@ -147,6 +162,10 @@ public:
     }
     return false;
   }
+
+private:
+  mlir::MLIRContext Context;
+  gmir::LegalizerPatternCache PatternCache;
 };
 } // namespace
 

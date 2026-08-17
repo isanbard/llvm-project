@@ -613,10 +613,15 @@ private:
         llvm::Attribute::InAlloca,  llvm::Attribute::Preallocated,
         llvm::Attribute::ByRef,     llvm::Attribute::SwiftError,
         llvm::Attribute::SwiftSelf, llvm::Attribute::SwiftAsync};
-    for (unsigned I = 0, E = CI.arg_size(); I != E; ++I)
+    for (unsigned I = 0, E = CI.arg_size(); I != E; ++I) {
+      // Fetch this argument's AttributeSet once rather than calling
+      // CI.paramHasAttr(I, Kind) per banned kind -- paramHasAttr rederives
+      // getAttributes().getParamAttrs(I) internally on every call.
+      llvm::AttributeSet ParamAttrs = CI.getAttributes().getParamAttrs(I);
       for (llvm::Attribute::AttrKind Kind : BannedParamAttrs)
-        if (CI.paramHasAttr(I, Kind))
+        if (ParamAttrs.hasAttribute(Kind))
           return false;
+    }
 
     gmir::LLTType RetTy;
     if (!CI.getType()->isVoidTy()) {
@@ -715,17 +720,28 @@ private:
   /// ConstantInt is -- a ConstantInt too wide for 64 bits, or some other
   /// unmapped/unsupported value).
   bool getOperands(llvm::Value *V, SmallVectorImpl<mlir::Value> &Out) {
-    auto It = ValueMap.find(V);
-    if (It != ValueMap.end()) {
+    // A single try_emplace both checks for and (speculatively) reserves
+    // V's slot, rather than a find() here plus a separate operator[]
+    // insert below -- two independent DenseMap probes on the (rare)
+    // miss-then-materialize path. On any failure path below, the
+    // speculative empty entry is erased again so a later lookup for the
+    // same unresolvable V doesn't wrongly find a stale empty "resolved to
+    // zero values" entry.
+    auto [It, Inserted] = ValueMap.try_emplace(V);
+    if (!Inserted) {
       Out.append(It->second.begin(), It->second.end());
       return true;
     }
     auto *CI = dyn_cast<ConstantInt>(V);
-    if (!CI || CI->getValue().getSignificantBits() > 64)
+    if (!CI || CI->getValue().getSignificantBits() > 64) {
+      ValueMap.erase(It);
       return false;
+    }
     gmir::LLTType Ty = convertType(Context, CI->getType());
-    if (!Ty)
+    if (!Ty) {
+      ValueMap.erase(It);
       return false;
+    }
     // Insert at the entry block's front-growing cursor, not wherever the
     // caller's Builder happens to be pointed -- see import()'s comment on
     // ConstantInsertPt for why: this constant may be memoized and reused
@@ -736,7 +752,7 @@ private:
         Builder, Builder.getUnknownLoc(), Ty,
         Builder.getI64IntegerAttr(CI->getSExtValue()));
     ConstantInsertPt = std::next(mlir::Block::iterator(ConstOp));
-    ValueMap[V] = {ConstOp.getResult()};
+    It->second.push_back(ConstOp.getResult());
     Out.push_back(ConstOp.getResult());
     return true;
   }

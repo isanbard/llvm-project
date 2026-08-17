@@ -32,24 +32,26 @@ template <> unsigned getGenericOpcode<gmir::SubOp>() {
   return TargetOpcode::G_SUB;
 }
 
-/// Thin wrapper around MF's target LegalizerInfo, letting patterns below
+/// Thin wrapper around a target's LegalizerInfo, letting patterns below
 /// ask "what does the target's *existing* legality rules say about this
 /// gmir op" without gmir having to hand-port its own copy of those rules
-/// (this milestone's whole point -- see GMIRLegalizer.h).
-/// MF.getSubtarget().getLegalizerInfo() is null for any target whose
-/// TargetSubtargetInfo doesn't override it (the base class's default);
-/// every in-tree target that actually reaches this pass via
-/// -enable-mlir-isel does (GMIRImporter/CallLowering already assume real
-/// GlobalISel support), but -enable-mlir-isel itself has no target
-/// allowlist, so treat a null LegalizerInfo the same as "nothing is
-/// NarrowScalar" rather than crashing: getAction() degrades to always
-/// reporting Legal, so every pattern below simply fails to match and
-/// legalize() is a no-op, same graceful-fallback shape as every other
-/// failure path in this pipeline.
+/// (this milestone's whole point -- see GMIRLegalizer.h). Held by value
+/// inside NarrowScalarAddSubPattern (see below) so pattern instances can
+/// be cached in LegalizerPatternCache across functions rather than
+/// rebuilt from a short-lived MachineFunction& each time.
+/// LI (MF.getSubtarget().getLegalizerInfo(), fetched by legalize() below)
+/// is null for any target whose TargetSubtargetInfo doesn't override it
+/// (the base class's default); every in-tree target that actually reaches
+/// this pass via -enable-mlir-isel does (GMIRImporter/CallLowering
+/// already assume real GlobalISel support), but -enable-mlir-isel itself
+/// has no target allowlist, so treat a null LegalizerInfo the same as
+/// "nothing is NarrowScalar" rather than crashing: getAction() degrades
+/// to always reporting Legal, so every pattern below simply fails to
+/// match and legalize() is a no-op, same graceful-fallback shape as every
+/// other failure path in this pipeline.
 class GMIRLegalizerInfoAdapter {
 public:
-  explicit GMIRLegalizerInfoAdapter(MachineFunction &MF)
-      : LI(MF.getSubtarget().getLegalizerInfo()) {}
+  explicit GMIRLegalizerInfoAdapter(const LegalizerInfo *LI) : LI(LI) {}
 
   LegalizeActionStep getAction(unsigned Opcode, ArrayRef<LLT> Types) const {
     if (!LI)
@@ -79,7 +81,7 @@ template <typename OpTy, typename CarryOOp, typename CarryEOp>
 class NarrowScalarAddSubPattern : public OpRewritePattern<OpTy> {
 public:
   NarrowScalarAddSubPattern(MLIRContext *Context,
-                            const GMIRLegalizerInfoAdapter &Adapter,
+                            GMIRLegalizerInfoAdapter Adapter,
                             const llvm::DataLayout &DL)
       : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
 
@@ -133,25 +135,53 @@ public:
   }
 
 private:
-  const GMIRLegalizerInfoAdapter &Adapter;
+  GMIRLegalizerInfoAdapter Adapter;
   const llvm::DataLayout &DL;
 };
 
 } // namespace
 
-bool gmir::legalize(func::FuncOp FuncOp, MachineFunction &MF) {
-  MLIRContext *Context = FuncOp.getContext();
-  GMIRLegalizerInfoAdapter Adapter(MF);
-  const llvm::DataLayout &DL = MF.getDataLayout();
+const FrozenRewritePatternSet &
+gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
+                                 const llvm::DataLayout &DL) {
+  auto It = Cache.find(LI);
+  if (It != Cache.end())
+    return It->second;
 
-  RewritePatternSet Patterns(Context);
+  RewritePatternSet Patterns(&Context);
   Patterns.add<
       NarrowScalarAddSubPattern<gmir::AddOp, gmir::UAddOOp, gmir::UAddEOp>>(
-      Context, Adapter, DL);
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<
       NarrowScalarAddSubPattern<gmir::SubOp, gmir::USubOOp, gmir::USubEOp>>(
-      Context, Adapter, DL);
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
 
-  FrozenRewritePatternSet Frozen(std::move(Patterns));
-  return succeeded(applyPatternsGreedily(FuncOp, Frozen));
+  return Cache.try_emplace(LI, std::move(Patterns)).first->second;
+}
+
+bool gmir::legalize(func::FuncOp FuncOp, MachineFunction &MF,
+                    LegalizerPatternCache &PatternCache) {
+  MLIRContext *Context = FuncOp.getContext();
+  const LegalizerInfo *LI = MF.getSubtarget().getLegalizerInfo();
+  const llvm::DataLayout &DL = MF.getDataLayout();
+  const FrozenRewritePatternSet &Frozen = PatternCache.get(*Context, LI, DL);
+
+  // Region simplification must stay off: applyPatternsGreedily's default
+  // config (GreedySimplifyRegionLevel::Aggressive) merges structurally-
+  // identical sibling blocks and erases unreachable ones as a side effect
+  // independent of whether any pattern above actually matched anything.
+  // MLIRToGMIRTranslator.cpp's GMIRToMIRWalker::run() parallel-walks
+  // FuncOp's blocks alongside the original llvm::Function's, assuming
+  // exact 1:1 lockstep correspondence (guaranteed by GMIRImporter, but not
+  // preserved by a block-merging pass run afterward) -- silently losing
+  // that correspondence desyncs the walk and crashes lowerReturn's
+  // block-terminator cast on perfectly valid input (e.g. two sibling
+  // blocks computing the same value before a shared successor). This pass
+  // only ever rewrites individual ops in place and never touches block
+  // structure, so there's nothing for region simplification to legitimately
+  // do here anyway.
+  GreedyRewriteConfig Config;
+  Config.setRegionSimplificationLevel(GreedySimplifyRegionLevel::Disabled);
+
+  return succeeded(applyPatternsGreedily(FuncOp, Frozen, Config));
 }
