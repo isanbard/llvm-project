@@ -36,22 +36,29 @@ template <> unsigned getGenericOpcode<gmir::SubOp>() {
 /// ask "what does the target's *existing* legality rules say about this
 /// gmir op" without gmir having to hand-port its own copy of those rules
 /// (this milestone's whole point -- see GMIRLegalizer.h).
-/// MF.getSubtarget().getLegalizerInfo() is dereferenced unchecked: every
-/// in-tree GlobalISel target defines one (a null return only happens for
-/// targets that never enable GlobalISel at all), matching this codebase's
-/// existing `*MF.getSubtarget().getCallLowering()` idiom
-/// (MLIRToGMIRTranslator.cpp).
+/// MF.getSubtarget().getLegalizerInfo() is null for any target whose
+/// TargetSubtargetInfo doesn't override it (the base class's default);
+/// every in-tree target that actually reaches this pass via
+/// -enable-mlir-isel does (GMIRImporter/CallLowering already assume real
+/// GlobalISel support), but -enable-mlir-isel itself has no target
+/// allowlist, so treat a null LegalizerInfo the same as "nothing is
+/// NarrowScalar" rather than crashing: getAction() degrades to always
+/// reporting Legal, so every pattern below simply fails to match and
+/// legalize() is a no-op, same graceful-fallback shape as every other
+/// failure path in this pipeline.
 class GMIRLegalizerInfoAdapter {
 public:
   explicit GMIRLegalizerInfoAdapter(MachineFunction &MF)
-      : LI(*MF.getSubtarget().getLegalizerInfo()) {}
+      : LI(MF.getSubtarget().getLegalizerInfo()) {}
 
   LegalizeActionStep getAction(unsigned Opcode, ArrayRef<LLT> Types) const {
-    return LI.getAction(LegalityQuery(Opcode, Types));
+    if (!LI)
+      return LegalizeActionStep(LegalizeActions::Legal, 0, LLT{});
+    return LI->getAction(LegalityQuery(Opcode, Types));
   }
 
 private:
-  const LegalizerInfo &LI;
+  const LegalizerInfo *LI;
 };
 
 /// Implements the single top-level `G_ADD`/`G_SUB` NarrowScalar action

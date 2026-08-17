@@ -134,8 +134,10 @@ public:
       return false;
     }
 
-    if (PrintGMIRAfterLegalize)
+    if (PrintGMIRAfterLegalize) {
       FuncOp.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
 
     if (!gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
       // CallLowering itself declined: defer to the existing selector, same

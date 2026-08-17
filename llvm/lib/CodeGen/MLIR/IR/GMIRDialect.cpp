@@ -119,24 +119,43 @@ void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
 // operand legitimately differs in type from its results, and gmir.merge's
 // single result legitimately differs from its operands), so each is a
 // plain hand-rolled check, matching this file's existing style of direct,
-// unabstracted per-op logic rather than a shared two-op helper.
+// unabstracted per-op logic rather than a shared two-op helper. Besides the
+// "all same type" check, also require the piece count times that shared
+// width to add up to the wide side's width (mirrors buildUnmerge/
+// buildMergeValues's own precondition: "the entire register (and no more)
+// must be covered by the input registers") -- with
+// `useDefaultTypePrinterParser` now on, gmir IR round-trips through text, so a
+// width mismatch here is no longer something only correctly-constructed C++
+// callers can produce.
 LogicalResult UnmergeOp::verify() {
   if (getDsts().empty())
     return emitOpError("expected at least one result");
-  mlir::Type Ty = getDsts().front().getType();
+  auto Ty = cast<gmir::LLTType>(getDsts().front().getType());
   for (mlir::Value Dst : getDsts().drop_front())
     if (Dst.getType() != Ty)
       return emitOpError("all results must have the same type");
+  auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
+  if (Ty.getScalarSizeInBits() == 0 || SrcTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (SrcTy.getScalarSizeInBits() !=
+      Ty.getScalarSizeInBits() * getDsts().size())
+    return emitOpError("result bit widths must sum to the operand's width");
   return success();
 }
 
 LogicalResult MergeOp::verify() {
   if (getSrcs().empty())
     return emitOpError("expected at least one operand");
-  mlir::Type Ty = getSrcs().front().getType();
+  auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
   for (mlir::Value Src : getSrcs().drop_front())
     if (Src.getType() != Ty)
       return emitOpError("all operands must have the same type");
+  auto DstTy = cast<gmir::LLTType>(getDst().getType());
+  if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (DstTy.getScalarSizeInBits() !=
+      Ty.getScalarSizeInBits() * getSrcs().size())
+    return emitOpError("operand bit widths must sum to the result's width");
   return success();
 }
 
