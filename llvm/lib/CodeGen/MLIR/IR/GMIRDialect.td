@@ -228,6 +228,38 @@ def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
   let results = (outs GMIR_LLTType:$res); // always a pointer LLT
 }
 
+def GMIR_AnyExtOp : GMIR_Op<"anyext", [Pure]> {
+  let summary = "Extends a scalar to a wider type with unspecified new bits, mirroring GlobalISel's G_ANYEXT";
+  let description = [{
+    Emitted only by GMIRLegalizer's WidenScalarPattern (see
+    GMIRLegalizer.cpp), to widen a too-narrow operand up to a legal width
+    before re-running the original op there -- correct (rather than
+    `zext`/`sext`) because for every op WidenScalarPattern handles, the
+    low-N result bits depend only on the low-N input bits, so the extended
+    high bits' actual value never matters. `hasVerifier = 1`: no stock ODS
+    trait expresses "result must be strictly wider than the operand"
+    (`SameOperandsAndResultType` doesn't fit -- the whole point of this op
+    is that they differ), so `AnyExtOp::verify()` in GMIRDialect.cpp checks
+    it by hand.
+  }];
+  let arguments = (ins GMIR_LLTType:$src);
+  let results = (outs GMIR_LLTType:$res);
+  let hasVerifier = 1;
+}
+
+def GMIR_TruncOp : GMIR_Op<"trunc", [Pure]> {
+  let summary = "Truncates a scalar to a narrower type, mirroring GlobalISel's G_TRUNC";
+  let description = [{
+    Inverse of `gmir.anyext`: emitted only by GMIRLegalizer's
+    WidenScalarPattern, to truncate a widened op's result back down to its
+    original width. See `gmir.anyext` for why `hasVerifier = 1` is needed
+    here too (checking `res` is strictly narrower than `src`).
+  }];
+  let arguments = (ins GMIR_LLTType:$src);
+  let results = (outs GMIR_LLTType:$res);
+  let hasVerifier = 1;
+}
+
 class GMIR_AddSubCarryOp<string mnemonic, list<Trait> traits = []>
     : GMIR_Op<mnemonic, !listconcat(traits, [Pure])> {
   let summary = "Add/sub with carry, mirroring GlobalISel's G_U{ADD,SUB}{O,E}";

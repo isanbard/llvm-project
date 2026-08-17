@@ -335,6 +335,25 @@ private:
       return true;
     }
 
+    if (auto AnyExt = dyn_cast<gmir::AnyExtOp>(&Op)) {
+      Register SrcReg = ValueToReg.lookup(AnyExt.getSrc());
+      LLT Ty =
+          convertLLT(cast<gmir::LLTType>(AnyExt.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildAnyExt(Res, SrcReg);
+      ValueToReg[AnyExt.getResult()] = Res;
+      return true;
+    }
+
+    if (auto Trunc = dyn_cast<gmir::TruncOp>(&Op)) {
+      Register SrcReg = ValueToReg.lookup(Trunc.getSrc());
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Trunc.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildTrunc(Res, SrcReg);
+      ValueToReg[Trunc.getResult()] = Res;
+      return true;
+    }
+
     if (auto Alloca = dyn_cast<gmir::AllocaOp>(&Op)) {
       LLT Ty =
           convertLLT(cast<gmir::LLTType>(Alloca.getResult().getType()), DL);

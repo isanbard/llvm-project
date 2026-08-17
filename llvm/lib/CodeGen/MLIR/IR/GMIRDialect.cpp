@@ -159,6 +159,31 @@ LogicalResult MergeOp::verify() {
   return success();
 }
 
+// Hand-written verifiers for GMIR_AnyExtOp/GMIR_TruncOp (`hasVerifier = 1`
+// in GMIRDialect.td, same reason as UnmergeOp/MergeOp above): each checks
+// that the width relationship the op's whole purpose depends on actually
+// holds -- no stock ODS trait expresses "result strictly wider/narrower
+// than the operand".
+LogicalResult AnyExtOp::verify() {
+  auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
+  auto ResTy = cast<gmir::LLTType>(getResult().getType());
+  if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (ResTy.getScalarSizeInBits() <= SrcTy.getScalarSizeInBits())
+    return emitOpError("result must be wider than the operand");
+  return success();
+}
+
+LogicalResult TruncOp::verify() {
+  auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
+  auto ResTy = cast<gmir::LLTType>(getResult().getType());
+  if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (ResTy.getScalarSizeInBits() >= SrcTy.getScalarSizeInBits())
+    return emitOpError("result must be narrower than the operand");
+  return success();
+}
+
 void GMIRDialect::initialize() {
   addTypes<
 #define GET_TYPEDEF_LIST

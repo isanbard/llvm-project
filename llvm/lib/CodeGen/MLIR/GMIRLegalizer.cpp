@@ -42,6 +42,9 @@ template <> unsigned getGenericOpcode<gmir::OrOp>() {
 template <> unsigned getGenericOpcode<gmir::XorOp>() {
   return TargetOpcode::G_XOR;
 }
+template <> unsigned getGenericOpcode<gmir::MulOp>() {
+  return TargetOpcode::G_MUL;
+}
 
 /// Thin wrapper around a target's LegalizerInfo, letting patterns below
 /// ask "what does the target's *existing* legality rules say about this
@@ -231,6 +234,49 @@ private:
   const llvm::DataLayout &DL;
 };
 
+/// Implements the single WidenScalar action shared verbatim by
+/// `G_ADD`/`G_AND`/`G_MUL`/`G_OR`/`G_XOR`/`G_SUB`
+/// (LegalizerHelper.cpp's widenScalar switch: any-extend both operands to
+/// the wide type, perform OpTy there, truncate the result back down).
+/// `G_ANYEXT`, not `ZEXT`/`SEXT`, is correct for all six of these ops --
+/// each one's low-N result bits depend only on the low-N input bits, so
+/// the extended high bits' actual value never affects the truncated
+/// result. Unlike the NarrowScalar patterns above, there's no split/carry
+/// bookkeeping at all: exactly one any-extend per operand, one op, one
+/// truncate.
+template <typename OpTy>
+class WidenScalarPattern : public OpRewritePattern<OpTy> {
+public:
+  WidenScalarPattern(MLIRContext *Context, GMIRLegalizerInfoAdapter Adapter,
+                     const llvm::DataLayout &DL)
+      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+
+  LogicalResult matchAndRewrite(OpTy Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    LLT DstTy = gmir::convertLLT(DstGTy, DL);
+    LegalizeActionStep Step =
+        Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
+    if (Step.Action != LegalizeActions::WidenScalar)
+      return failure();
+
+    MLIRContext *Context = Rewriter.getContext();
+    gmir::LLTType WideGTy = gmir::convertToGMIRType(*Context, Step.NewType);
+    Location Loc = Op.getLoc();
+
+    auto LhsWide = gmir::AnyExtOp::create(Rewriter, Loc, WideGTy, Op.getLhs());
+    auto RhsWide = gmir::AnyExtOp::create(Rewriter, Loc, WideGTy, Op.getRhs());
+    auto WideRes = OpTy::create(Rewriter, Loc, WideGTy, LhsWide.getResult(),
+                                RhsWide.getResult());
+    Rewriter.replaceOpWithNewOp<gmir::TruncOp>(Op, DstGTy, WideRes.getResult());
+    return success();
+  }
+
+private:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+};
+
 } // namespace
 
 const FrozenRewritePatternSet &
@@ -252,6 +298,18 @@ gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
   Patterns.add<NarrowScalarBitwisePattern<gmir::OrOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<NarrowScalarBitwisePattern<gmir::XorOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::AddOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::SubOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::AndOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::OrOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::XorOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<WidenScalarPattern<gmir::MulOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
 
   return Cache.try_emplace(LI, std::move(Patterns)).first->second;
