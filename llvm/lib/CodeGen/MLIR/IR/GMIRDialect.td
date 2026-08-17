@@ -260,9 +260,12 @@ def GMIR_USubEOp : GMIR_AddSubCarryOp<"usube"> {
 def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
   let summary = "Splits a scalar into narrower pieces, mirroring G_UNMERGE_VALUES";
   let description = [{
-    Emitted only by GMIRLegalizer's NarrowScalarAddSubPattern, to split a
+    Emitted only by GMIRLegalizer's NarrowScalar patterns
+    (NarrowScalarAddSubPattern and NarrowScalarBitwisePattern), to split a
     too-wide operand into `dsts.size()` contiguous narrower pieces before
-    feeding them to a chain of `gmir.uaddo`/`gmir.uadde` (or usubo/usube).
+    feeding them to a chain of `gmir.uaddo`/`gmir.uadde` (or usubo/usube),
+    or independently to `gmir.and`/`or`/`xor` (no carry -- see
+    NarrowScalarBitwisePattern), depending on which op is being narrowed.
     `hasVerifier = 1`: no stock ODS trait fits ("all *results* share one
     type" isn't a built-in trait, and `src`'s type legitimately differs
     from `dsts`'s, ruling out `SameOperandsAndResultType`), so
@@ -276,11 +279,12 @@ def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
 def GMIR_MergeOp : GMIR_Op<"merge", [Pure]> {
   let summary = "Concatenates narrow pieces into a scalar, mirroring G_MERGE_VALUES";
   let description = [{
-    Inverse of `gmir.unmerge`: reassembles a NarrowScalarAddSubPattern's
-    per-piece `gmir.uaddo`/`gmir.uadde` (or usubo/usube) results back into
-    the original wider `!gmir.llt`. See `gmir.unmerge` for why
-    `hasVerifier = 1` is needed here too (checking `srcs` all share one
-    type).
+    Inverse of `gmir.unmerge`: reassembles a NarrowScalar pattern's
+    per-piece results (`gmir.uaddo`/`gmir.uadde`/`usubo`/`usube` for
+    NarrowScalarAddSubPattern, or a narrowed `gmir.and`/`or`/`xor` for
+    NarrowScalarBitwisePattern) back into the original wider `!gmir.llt`.
+    See `gmir.unmerge` for why `hasVerifier = 1` is needed here too
+    (checking `srcs` all share one type).
   }];
   let arguments = (ins Variadic<GMIR_LLTType>:$srcs);
   let results = (outs GMIR_LLTType:$dst);

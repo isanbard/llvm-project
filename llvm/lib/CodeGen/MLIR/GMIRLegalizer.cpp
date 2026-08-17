@@ -99,6 +99,26 @@ getExactNarrowScalarSplit(const GMIRLegalizerInfoAdapter &Adapter,
   return std::make_pair(NarrowTy, NumParts);
 }
 
+/// Unmerges Op's lhs/rhs operands into NumParts NarrowGTy-typed pieces
+/// each. The common first step of both NarrowScalarAddSubPattern's and
+/// NarrowScalarBitwisePattern's rewrites -- they diverge only afterward,
+/// on how the per-chunk op sequence composes (carry-chained vs.
+/// independent). Factored out so a future fix to this step (e.g. general
+/// non-exact-multiple leftover handling, currently out of scope -- see
+/// getExactNarrowScalarSplit) only needs to change one place, not one
+/// per NarrowScalar pattern.
+template <typename OpTy>
+std::pair<gmir::UnmergeOp, gmir::UnmergeOp>
+unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
+                      gmir::LLTType NarrowGTy, unsigned NumParts) {
+  SmallVector<mlir::Type, 4> NarrowResultTypes(NumParts, NarrowGTy);
+  auto LhsParts =
+      gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getLhs());
+  auto RhsParts =
+      gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getRhs());
+  return {LhsParts, RhsParts};
+}
+
 /// Implements the single top-level `G_ADD`/`G_SUB` NarrowScalar action
 /// (LegalizerHelper::narrowScalarAddSub's exact hi/lo+carry split
 /// algorithm, ported to build gmir ops instead of real MIR): unmerge each
@@ -136,11 +156,8 @@ public:
     gmir::LLTType CarryGTy = gmir::convertToGMIRType(*Context, LLT::integer(1));
 
     Location Loc = Op.getLoc();
-    SmallVector<mlir::Type, 4> NarrowResultTypes(NumParts, NarrowGTy);
-    auto LhsParts =
-        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getLhs());
-    auto RhsParts =
-        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getRhs());
+    auto [LhsParts, RhsParts] =
+        unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
 
     SmallVector<mlir::Value, 4> DstParts;
     mlir::Value CarryIn;
@@ -196,11 +213,8 @@ public:
     gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
 
     Location Loc = Op.getLoc();
-    SmallVector<mlir::Type, 4> NarrowResultTypes(NumParts, NarrowGTy);
-    auto LhsParts =
-        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getLhs());
-    auto RhsParts =
-        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getRhs());
+    auto [LhsParts, RhsParts] =
+        unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
 
     SmallVector<mlir::Value, 4> DstParts;
     for (unsigned I = 0; I != NumParts; ++I) {
