@@ -27,6 +27,16 @@
 ; gmir.uadde/usube (second chunk) -> gmir.merge) -- these ops only ever
 ; come from that pattern, never from GMIRImporter directly, so their
 ; presence here is unambiguous evidence the new legalizer code path ran.
+;
+; M4 slice 2 extends this file (not a new one -- same target, same
+; "prove the narrowing pattern really ran" theme) to gmir.and/gmir.or/
+; gmir.xor: X86LegalizerInfo.cpp:253-267 gives G_AND/G_OR/G_XOR the exact
+; same clampScalar(0, s8, sMaxScalar) shape as G_ADD/G_SUB, so s64 AND/OR/
+; XOR resolves to NarrowScalar(s32) on i686 too. NarrowScalarBitwisePattern
+; implements LegalizerHelper::narrowScalarBasic's algorithm instead --
+; unlike add/sub, there's no carry to thread between chunks, so each
+; narrow chunk pair gets the same op applied independently (gmir.unmerge ->
+; gmir.and/or/xor x2 (no carry) -> gmir.merge).
 
 define i64 @add64(i64 %a, i64 %b) {
 entry:
@@ -50,4 +60,40 @@ entry:
 ; CHECK: "gmir.unmerge"
 ; CHECK: "gmir.usubo"
 ; CHECK: "gmir.usube"
+; CHECK: "gmir.merge"
+
+define i64 @and64(i64 %a, i64 %b) {
+entry:
+  %c = and i64 %a, %b
+  ret i64 %c
+}
+; CHECK-LABEL: func.func @and64
+; CHECK: "gmir.unmerge"
+; CHECK: "gmir.unmerge"
+; CHECK: gmir.and
+; CHECK: gmir.and
+; CHECK: "gmir.merge"
+
+define i64 @or64(i64 %a, i64 %b) {
+entry:
+  %c = or i64 %a, %b
+  ret i64 %c
+}
+; CHECK-LABEL: func.func @or64
+; CHECK: "gmir.unmerge"
+; CHECK: "gmir.unmerge"
+; CHECK: gmir.or
+; CHECK: gmir.or
+; CHECK: "gmir.merge"
+
+define i64 @xor64(i64 %a, i64 %b) {
+entry:
+  %c = xor i64 %a, %b
+  ret i64 %c
+}
+; CHECK-LABEL: func.func @xor64
+; CHECK: "gmir.unmerge"
+; CHECK: "gmir.unmerge"
+; CHECK: gmir.xor
+; CHECK: gmir.xor
 ; CHECK: "gmir.merge"

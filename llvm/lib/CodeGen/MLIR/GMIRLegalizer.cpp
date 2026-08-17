@@ -15,6 +15,8 @@
 #include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include <optional>
+#include <utility>
 
 using namespace llvm;
 using namespace mlir;
@@ -30,6 +32,15 @@ template <> unsigned getGenericOpcode<gmir::AddOp>() {
 }
 template <> unsigned getGenericOpcode<gmir::SubOp>() {
   return TargetOpcode::G_SUB;
+}
+template <> unsigned getGenericOpcode<gmir::AndOp>() {
+  return TargetOpcode::G_AND;
+}
+template <> unsigned getGenericOpcode<gmir::OrOp>() {
+  return TargetOpcode::G_OR;
+}
+template <> unsigned getGenericOpcode<gmir::XorOp>() {
+  return TargetOpcode::G_XOR;
 }
 
 /// Thin wrapper around a target's LegalizerInfo, letting patterns below
@@ -63,6 +74,31 @@ private:
   const LegalizerInfo *LI;
 };
 
+/// Returns {NarrowTy, NumParts} if GenericOpcode's action on DstTy is an
+/// exact, leftover-free NarrowScalar split; std::nullopt otherwise (not
+/// NarrowScalar, or the split isn't exact -- general non-exact-multiple
+/// leftover handling is out of scope, see GMIRLegalizer.h). Shared by
+/// NarrowScalarAddSubPattern and NarrowScalarBitwisePattern below -- both
+/// need the identical "is this an exact NarrowScalar split, and if so
+/// what to split into" check before their per-op-family rewrite logic
+/// (carry-chained vs. independent-chunk) diverges.
+std::optional<std::pair<LLT, unsigned>>
+getExactNarrowScalarSplit(const GMIRLegalizerInfoAdapter &Adapter,
+                          unsigned GenericOpcode, LLT DstTy) {
+  LegalizeActionStep Step = Adapter.getAction(GenericOpcode, {DstTy});
+  if (Step.Action != LegalizeActions::NarrowScalar)
+    return std::nullopt;
+  LLT NarrowTy = Step.NewType;
+  unsigned DstBits = DstTy.getSizeInBits();
+  unsigned NarrowBits = NarrowTy.getSizeInBits();
+  if (NarrowBits == 0 || DstBits % NarrowBits != 0)
+    return std::nullopt;
+  unsigned NumParts = DstBits / NarrowBits;
+  if (NumParts < 2)
+    return std::nullopt;
+  return std::make_pair(NarrowTy, NumParts);
+}
+
 /// Implements the single top-level `G_ADD`/`G_SUB` NarrowScalar action
 /// (LegalizerHelper::narrowScalarAddSub's exact hi/lo+carry split
 /// algorithm, ported to build gmir ops instead of real MIR): unmerge each
@@ -89,19 +125,11 @@ public:
                                 PatternRewriter &Rewriter) const override {
     auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
     LLT DstTy = gmir::convertLLT(DstGTy, DL);
-    LegalizeActionStep Step =
-        Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
-    if (Step.Action != LegalizeActions::NarrowScalar)
+    auto Split =
+        getExactNarrowScalarSplit(Adapter, getGenericOpcode<OpTy>(), DstTy);
+    if (!Split)
       return failure();
-
-    LLT NarrowTy = Step.NewType;
-    unsigned DstBits = DstTy.getSizeInBits();
-    unsigned NarrowBits = NarrowTy.getSizeInBits();
-    if (NarrowBits == 0 || DstBits % NarrowBits != 0)
-      return failure();
-    unsigned NumParts = DstBits / NarrowBits;
-    if (NumParts < 2)
-      return failure();
+    auto [NarrowTy, NumParts] = *Split;
 
     MLIRContext *Context = Rewriter.getContext();
     gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
@@ -139,6 +167,56 @@ private:
   const llvm::DataLayout &DL;
 };
 
+/// Implements LegalizerHelper::narrowScalarBasic's algorithm for
+/// `G_AND`/`G_OR`/`G_XOR` (dispatched to it in LegalizerHelper.cpp's
+/// narrowScalar switch): unlike NarrowScalarAddSubPattern above, there's
+/// no carry to thread between chunks -- each narrow chunk pair is
+/// independent, so OpTy is just reapplied to every pair of unmerged
+/// pieces directly. Shares getExactNarrowScalarSplit's guard logic with
+/// NarrowScalarAddSubPattern.
+template <typename OpTy>
+class NarrowScalarBitwisePattern : public OpRewritePattern<OpTy> {
+public:
+  NarrowScalarBitwisePattern(MLIRContext *Context,
+                             GMIRLegalizerInfoAdapter Adapter,
+                             const llvm::DataLayout &DL)
+      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+
+  LogicalResult matchAndRewrite(OpTy Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    LLT DstTy = gmir::convertLLT(DstGTy, DL);
+    auto Split =
+        getExactNarrowScalarSplit(Adapter, getGenericOpcode<OpTy>(), DstTy);
+    if (!Split)
+      return failure();
+    auto [NarrowTy, NumParts] = *Split;
+
+    MLIRContext *Context = Rewriter.getContext();
+    gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+
+    Location Loc = Op.getLoc();
+    SmallVector<mlir::Type, 4> NarrowResultTypes(NumParts, NarrowGTy);
+    auto LhsParts =
+        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getLhs());
+    auto RhsParts =
+        gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getRhs());
+
+    SmallVector<mlir::Value, 4> DstParts;
+    for (unsigned I = 0; I != NumParts; ++I) {
+      auto Chunk = OpTy::create(Rewriter, Loc, NarrowGTy, LhsParts.getDsts()[I],
+                                RhsParts.getDsts()[I]);
+      DstParts.push_back(Chunk.getResult());
+    }
+    Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+    return success();
+  }
+
+private:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+};
+
 } // namespace
 
 const FrozenRewritePatternSet &
@@ -154,6 +232,12 @@ gmir::LegalizerPatternCache::get(MLIRContext &Context, const LegalizerInfo *LI,
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<
       NarrowScalarAddSubPattern<gmir::SubOp, gmir::USubOOp, gmir::USubEOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<NarrowScalarBitwisePattern<gmir::AndOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<NarrowScalarBitwisePattern<gmir::OrOp>>(
+      &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<NarrowScalarBitwisePattern<gmir::XorOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
 
   return Cache.try_emplace(LI, std::move(Patterns)).first->second;
