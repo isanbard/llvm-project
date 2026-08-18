@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "GMIRCombiner.h"
 #include "GMIRImporter.h"
 #include "GMIRLegalizer.h"
 #include "IR/GMIRDialect.h"
@@ -52,6 +53,17 @@ using namespace llvm;
 static cl::opt<bool> PrintGMIRAfterLegalize(
     "print-gmir-after-legalize", cl::Hidden,
     cl::desc("Print the gmir IR right after GMIRLegalizer runs, before "
+             "MLIRToGMIRTranslator lowers it to real MIR"));
+
+// M5 slice 1's proof mechanism, same rationale as PrintGMIRAfterLegalize
+// above: on AArch64 (unlike X86 at -O0), a real downstream GICombiner
+// pass runs even at -O0-equivalent (AArch64O0PreLegalizerCombiner), so
+// the usual -global-isel asm-diff oracle can't by itself distinguish
+// "GMIRCombiner's own fold()/CSE ran" from "the safety-net combiner
+// quietly did the work instead" -- see GMIRCombiner.h.
+static cl::opt<bool> PrintGMIRAfterCombine(
+    "print-gmir-after-combine", cl::Hidden,
+    cl::desc("Print the gmir IR right after GMIRCombiner runs, before "
              "MLIRToGMIRTranslator lowers it to real MIR"));
 
 namespace {
@@ -129,7 +141,18 @@ public:
       llvm::errs() << '\n';
     }
 
-    // Everything below is only needed once import/legalization succeeded
+    if (!gmir::combine(FuncOp, CombinerCache)) {
+      MF.getProperties().setFailedISel();
+      return false;
+    }
+
+    if (PrintGMIRAfterCombine) {
+      FuncOp.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+
+    // Everything below is only needed once import/legalization/combining
+    // succeeded
     // -- fetched here, after that check, rather than unconditionally up
     // front, so a function outside the supported subset (the common case
     // for real-world code today) doesn't pay for an unused BPI lookup, a
@@ -166,6 +189,7 @@ public:
 private:
   mlir::MLIRContext Context;
   gmir::LegalizerPatternCache PatternCache;
+  gmir::CombinerPatternCache CombinerCache;
 };
 } // namespace
 

@@ -36,6 +36,174 @@ using namespace llvm::gmir;
 // on via matchPattern(op, m_Constant()).
 OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) { return getValueAttr(); }
 
+namespace {
+// gmir.constant always stores its value sign-extended into a 64-bit
+// I64Attr regardless of the op's real (possibly narrower) width -- see
+// GMIR_ConstantOp's doc comment and MLIRToGMIRTranslator.cpp's matching
+// .trunc() on read. Truncating back down to Width before inspecting or
+// combining is required for correctness at any width other than 64:
+// e.g. at width 1, the bit patterns for -1 (all-ones) and +1 are
+// identical, so comparing the raw 64-bit sign-extended value would
+// conflate them; and computing arithmetic directly on the 64-bit
+// sign-extended values (rather than truncating first) would silently
+// skip the real op's actual-width wraparound (e.g. i32 INT_MAX + 1
+// must wrap at 32 bits, not 64).
+std::optional<APInt> getGMIRConstOperand(mlir::Attribute Attr, unsigned Width) {
+  auto IntAttr = dyn_cast_or_null<IntegerAttr>(Attr);
+  if (!IntAttr)
+    return std::nullopt;
+  return IntAttr.getValue().trunc(Width);
+}
+
+// Inverse of getGMIRConstOperand: packages Value (already truncated to
+// the op's real width) as the 64-bit-sign-extended I64Attr
+// gmir.constant expects.
+IntegerAttr makeGMIRConstAttr(MLIRContext *Context, APInt Value) {
+  return IntegerAttr::get(IntegerType::get(Context, 64), Value.sext(64));
+}
+} // namespace
+
+// The tier-1 DAGCombiner-style algebraic identity folds below (M5 slice
+// 1, see ~/llvm/mlir_instruction_selection_plan.md) each reduce a
+// binop to one of its own existing operands (no materialization
+// needed) wherever possible, falling back to computing the real
+// constant-arithmetic result when both operands are constant. Every
+// rule here is unconditional in real DAGCombiner (no TLI/legality/
+// hasOneUse() gating) -- see the design doc for the exact
+// DAGCombiner.cpp provenance of each one.
+OpFoldResult AddOp::fold(FoldAdaptor adaptor) {
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  // x + 0 -> x (either side, gmir.add is Commutative).
+  if (Rhs && Rhs->isZero())
+    return getLhs();
+  if (Lhs && Lhs->isZero())
+    return getRhs();
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs + *Rhs);
+  return {};
+}
+
+OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
+  // x - x -> 0 (SSA value equality, not constant matching) -- the one
+  // identity in this file needing a *new* constant rather than an
+  // existing operand, turned into a real gmir.constant op by
+  // GMIRDialect::materializeConstant below.
+  if (getLhs() == getRhs())
+    return makeGMIRConstAttr(getContext(), APInt::getZero(64));
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs - *Rhs);
+  return {};
+}
+
+OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  // x * 0 -> 0 (the zero operand already IS the correct result value).
+  if (Rhs && Rhs->isZero())
+    return getRhs();
+  if (Lhs && Lhs->isZero())
+    return getLhs();
+  // x * 1 -> x.
+  if (Rhs && Rhs->isOne())
+    return getLhs();
+  if (Lhs && Lhs->isOne())
+    return getRhs();
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs * *Rhs);
+  return {};
+}
+
+OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
+  // x & x -> x (SSA value equality).
+  if (getLhs() == getRhs())
+    return getLhs();
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  // x & 0 -> 0 (the zero operand already IS the correct result). Not a
+  // literal DAGCombiner one-liner for scalars (only spelled out as a
+  // vector-splat form there), but a trivially-true, zero-risk identity.
+  if (Rhs && Rhs->isZero())
+    return getRhs();
+  if (Lhs && Lhs->isZero())
+    return getLhs();
+  // x & -1 -> x.
+  if (Rhs && Rhs->isAllOnes())
+    return getLhs();
+  if (Lhs && Lhs->isAllOnes())
+    return getRhs();
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs & *Rhs);
+  return {};
+}
+
+OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
+  // x | x -> x (SSA value equality).
+  if (getLhs() == getRhs())
+    return getLhs();
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  // x | 0 -> x. Not a literal DAGCombiner scalar one-liner (only the
+  // vector-splat form exists there), same rationale as AndOp's x&0->0.
+  if (Rhs && Rhs->isZero())
+    return getLhs();
+  if (Lhs && Lhs->isZero())
+    return getRhs();
+  // x | -1 -> -1 (the all-ones operand already IS the correct result).
+  // Same "not a literal scalar DAGCombiner line" caveat as x&0->0/x|0->x.
+  if (Rhs && Rhs->isAllOnes())
+    return getRhs();
+  if (Lhs && Lhs->isAllOnes())
+    return getLhs();
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs | *Rhs);
+  return {};
+}
+
+OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
+  auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+  // x ^ 0 -> x.
+  if (Rhs && Rhs->isZero())
+    return getLhs();
+  if (Lhs && Lhs->isZero())
+    return getRhs();
+  if (Lhs && Rhs)
+    return makeGMIRConstAttr(getContext(), *Lhs ^ *Rhs);
+  return {};
+}
+
+// GMIRDialect::materializeConstant -- lets the greedy pattern rewrite
+// driver turn an Attribute-typed OpFoldResult (e.g. SubOp::fold's
+// `x-x -> 0`, or any of the two-constant-operand arithmetic folds
+// above) back into a real gmir.constant op when a live Value is
+// actually needed downstream. Declared via GMIRDialect.td's
+// `hasConstantMaterializer = 1`.
+mlir::Operation *GMIRDialect::materializeConstant(mlir::OpBuilder &builder,
+                                                  mlir::Attribute value,
+                                                  mlir::Type type,
+                                                  mlir::Location loc) {
+  auto IntAttr = dyn_cast<mlir::IntegerAttr>(value);
+  auto LLTTy = dyn_cast<gmir::LLTType>(type);
+  if (!IntAttr || !LLTTy)
+    return nullptr;
+  return gmir::ConstantOp::create(builder, loc, LLTTy, IntAttr);
+}
+
 // BranchOpInterface methods for GMIR_BrOp/GMIR_CondBrOp -- ODS only
 // declares these (DeclareOpInterfaceMethods), it doesn't define them.
 // Mirrors mlir::cf::BranchOp/CondBranchOp exactly

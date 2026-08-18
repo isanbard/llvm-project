@@ -34,6 +34,11 @@ def GMIR_Dialect : Dialect {
   // list) -- gmir ops themselves only ever used custom assemblyFormat or
   // were never printed at all until now.
   let useDefaultTypePrinterParser = 1;
+  // Lets the greedy pattern rewrite driver turn an Attribute-typed
+  // OpFoldResult (e.g. SubOp::fold's `x-x -> 0`, which needs a *new*
+  // zero value rather than an existing operand) back into a real
+  // gmir.constant op -- see GMIRDialect.cpp's materializeConstant.
+  let hasConstantMaterializer = 1;
 }
 
 class GMIR_Type<string name, string typeMnemonic, list<Trait> traits = [],
@@ -73,14 +78,36 @@ class GMIR_BinOp<string mnemonic, list<Trait> traits = []>
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($res)";
 }
 
-def GMIR_AddOp  : GMIR_BinOp<"add",  [Commutative]>;
+// `hasFolder = 1` on the six ops below (not GMIR_UMulHOp/GMIR_SDivOp,
+// out of scope for M5 slice 1): implements DAGCombiner-style tier-1
+// algebraic identities (e.g. `x+0 -> x`) directly as MLIR op folders,
+// the idiomatic mechanism for "reduce to one of my own operands, or to
+// a constant, given my operands' current values" -- fires automatically
+// wherever applyPatternsGreedily already runs (GMIRLegalizer.cpp,
+// GMIRCombiner.cpp), no separate pattern registration needed. See
+// GMIRDialect.cpp for the fold() bodies and ~/llvm/
+// mlir_instruction_selection_plan.md's M5 section for the DAGCombiner
+// provenance of each rule.
+def GMIR_AddOp  : GMIR_BinOp<"add",  [Commutative]> {
+  let hasFolder = 1;
+}
 def GMIR_UMulHOp : GMIR_BinOp<"umulh", [Commutative]>;
-def GMIR_SubOp  : GMIR_BinOp<"sub">;
-def GMIR_MulOp  : GMIR_BinOp<"mul",  [Commutative]>;
+def GMIR_SubOp  : GMIR_BinOp<"sub"> {
+  let hasFolder = 1;
+}
+def GMIR_MulOp  : GMIR_BinOp<"mul",  [Commutative]> {
+  let hasFolder = 1;
+}
 def GMIR_SDivOp : GMIR_BinOp<"sdiv">;
-def GMIR_AndOp  : GMIR_BinOp<"and",  [Commutative]>;
-def GMIR_OrOp   : GMIR_BinOp<"or",   [Commutative]>;
-def GMIR_XorOp  : GMIR_BinOp<"xor",  [Commutative]>;
+def GMIR_AndOp  : GMIR_BinOp<"and",  [Commutative]> {
+  let hasFolder = 1;
+}
+def GMIR_OrOp   : GMIR_BinOp<"or",   [Commutative]> {
+  let hasFolder = 1;
+}
+def GMIR_XorOp  : GMIR_BinOp<"xor",  [Commutative]> {
+  let hasFolder = 1;
+}
 
 def GMIR_ConstantOp : GMIR_Op<"constant", [Pure, ConstantLike]> {
   let summary = "A constant of `!gmir.llt` type";
