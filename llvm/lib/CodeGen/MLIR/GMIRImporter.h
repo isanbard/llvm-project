@@ -6,12 +6,18 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Imports a single-basic-block, scalar-integer-arithmetic-only
-// llvm::Function directly into `gmir` ops, without going through MLIR's
-// `llvm` dialect: mlir::translateLLVMIRToModule takes ownership of a whole
-// llvm::Module for a one-shot translation, which doesn't fit a pass that
-// runs per-function on a Module shared with the rest of the compilation.
-// See ~/llvm/mlir_instruction_selection_plan.md for the full rationale.
+// Imports an llvm::Function directly into `gmir` ops, without going
+// through MLIR's `llvm` dialect: mlir::translateLLVMIRToModule takes
+// ownership of a whole llvm::Module for a one-shot translation, which
+// doesn't fit a pass that runs per-function on a Module shared with the
+// rest of the compilation. Supported subset has grown milestone by
+// milestone since the original single-basic-block, scalar-integer-
+// arithmetic-only M1 scaffolding -- multi-block control flow with
+// PHI-derived block arguments, static allocas, loads/stores (including
+// aggregate flattening), GEPs, and direct calls are all handled now;
+// see GMIRImporter.cpp's per-instruction dispatch for the exact current
+// list and ~/llvm/mlir_instruction_selection_plan.md for the full
+// rationale and roadmap.
 //
 //===----------------------------------------------------------------------===//
 

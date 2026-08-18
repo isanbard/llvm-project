@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 //
 // Imports the current MachineFunction's llvm::Function into `gmir` ops
-// (GMIRImporter) and, if that succeeds, translates them into real generic
-// MIR (MLIRToGMIRTranslator). Both steps only ever handle M1's supported
-// subset (straight-line scalar-integer arithmetic); anything else makes
-// the importer fail, in which case this pass defers to the existing
-// selector exactly as it always has. See
+// (GMIRImporter), legalizes them against the target's real LegalizerInfo
+// (GMIRLegalizer), runs DAGCombiner-style algebraic simplification
+// (GMIRCombiner), and, if all three succeed, translates the result into
+// real generic MIR (MLIRToGMIRTranslator). Each step only ever handles
+// its own currently-supported subset; anything outside it makes that
+// step fail, in which case this pass defers to the existing selector
+// exactly as it always has. See
 // ~/llvm/mlir_instruction_selection_plan.md for the full architecture.
 //
 //===----------------------------------------------------------------------===//

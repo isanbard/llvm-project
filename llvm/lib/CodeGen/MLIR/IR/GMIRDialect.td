@@ -259,11 +259,13 @@ def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
 def GMIR_AnyExtOp : GMIR_Op<"anyext", [Pure]> {
   let summary = "Extends a scalar to a wider type with unspecified new bits, mirroring GlobalISel's G_ANYEXT";
   let description = [{
-    Emitted only by GMIRLegalizer's WidenScalarPattern (see
-    GMIRLegalizer.cpp), to widen a too-narrow operand up to a legal width
-    before re-running the original op there -- correct (rather than
-    `zext`/`sext`) because for every op WidenScalarPattern handles, the
-    low-N result bits depend only on the low-N input bits, so the extended
+    Emitted only by GMIRLegalizer's shared rewriteWidenScalar helper (see
+    GMIRLegalizer.cpp, called from AddSubLegalizePattern's/
+    BitwiseLegalizePattern's/MulLegalizePattern's WidenScalar dispatch
+    case), to widen a too-narrow operand up to a legal width before
+    re-running the original op there -- correct (rather than `zext`/
+    `sext`) because for every op rewriteWidenScalar handles, the low-N
+    result bits depend only on the low-N input bits, so the extended
     high bits' actual value never matters. `hasVerifier = 1`: no stock ODS
     trait expresses "result must be strictly wider than the operand"
     (`SameOperandsAndResultType` doesn't fit -- the whole point of this op
@@ -278,10 +280,11 @@ def GMIR_AnyExtOp : GMIR_Op<"anyext", [Pure]> {
 def GMIR_TruncOp : GMIR_Op<"trunc", [Pure]> {
   let summary = "Truncates a scalar to a narrower type, mirroring GlobalISel's G_TRUNC";
   let description = [{
-    Inverse of `gmir.anyext`: emitted only by GMIRLegalizer's
-    WidenScalarPattern, to truncate a widened op's result back down to its
-    original width. See `gmir.anyext` for why `hasVerifier = 1` is needed
-    here too (checking `res` is strictly narrower than `src`).
+    Inverse of `gmir.anyext`: emitted only by GMIRLegalizer's shared
+    rewriteWidenScalar helper, to truncate a widened op's result back
+    down to its original width. See `gmir.anyext` for why
+    `hasVerifier = 1` is needed here too (checking `res` is strictly
+    narrower than `src`).
   }];
   let arguments = (ins GMIR_LLTType:$src);
   let results = (outs GMIR_LLTType:$res);
@@ -296,7 +299,7 @@ class GMIR_AddSubCarryOp<string mnemonic, list<Trait> traits = []>
     `G_USUBO`/`G_USUBE` -- `carryOut` is a boolean-width (`!gmir.llt<1, ...>`)
     result, not the same type as `dst`, which is why this doesn't reuse
     `GMIR_BinOp` (its `SameOperandsAndResultType` doesn't fit). Emitted only
-    by GMIRLegalizer's NarrowScalarAddSubPattern (see GMIRLegalizer.cpp) --
+    by GMIRLegalizer's AddSubLegalizePattern (see GMIRLegalizer.cpp) --
     GMIRImporter never produces these directly, since LLVM IR has no
     surface-level add-with-carry construct that survives to this pipeline's
     supported subset.
@@ -321,12 +324,14 @@ def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
   let summary = "Splits a value into narrower pieces, mirroring G_UNMERGE_VALUES";
   let description = [{
     Two distinct uses, both emitted only by GMIRLegalizer, mirroring
-    G_UNMERGE_VALUES's own dual real-GlobalISel role: (1) NarrowScalar
-    patterns (NarrowScalarAddSubPattern, NarrowScalarBitwisePattern) split
-    a too-wide *scalar* operand into `dsts.size()` contiguous narrower
-    scalar pieces; (2) FewerElementsScalarizePattern splits a *vector*
-    operand into its `dsts.size()` scalar lanes (one dst per element, not
-    a bit-width split) before scalarizing a vector op. `UnmergeOp::verify()`
+    G_UNMERGE_VALUES's own dual real-GlobalISel role: (1) AddSubLegalizePattern's/
+    BitwiseLegalizePattern's/MulLegalizePattern's NarrowScalar dispatch
+    cases split a too-wide *scalar* operand into `dsts.size()` contiguous
+    narrower scalar pieces; (2) the shared rewriteFewerElements helper
+    (called from all three merged patterns' FewerElements dispatch case)
+    splits a *vector* operand into its `dsts.size()` scalar lanes (one
+    dst per element, not a bit-width split) before scalarizing a vector
+    op. `UnmergeOp::verify()`
     in GMIRDialect.cpp distinguishes the two by `src`'s shape and checks
     each accordingly -- no stock ODS trait fits either case ("all
     *results* share one type" isn't a built-in trait, and `src`'s type
@@ -341,10 +346,10 @@ def GMIR_UnmergeOp : GMIR_Op<"unmerge", [Pure]> {
 def GMIR_MergeOp : GMIR_Op<"merge", [Pure]> {
   let summary = "Concatenates narrow pieces into a scalar, mirroring G_MERGE_VALUES";
   let description = [{
-    Inverse of `gmir.unmerge`: reassembles a NarrowScalar pattern's
+    Inverse of `gmir.unmerge`: reassembles a NarrowScalar dispatch case's
     per-piece results (`gmir.uaddo`/`gmir.uadde`/`usubo`/`usube` for
-    NarrowScalarAddSubPattern, or a narrowed `gmir.and`/`or`/`xor` for
-    NarrowScalarBitwisePattern) back into the original wider `!gmir.llt`.
+    AddSubLegalizePattern, or a narrowed `gmir.and`/`or`/`xor` for
+    BitwiseLegalizePattern) back into the original wider `!gmir.llt`.
     See `gmir.unmerge` for why `hasVerifier = 1` is needed here too
     (checking `srcs` all share one type).
   }];
@@ -356,9 +361,11 @@ def GMIR_MergeOp : GMIR_Op<"merge", [Pure]> {
 def GMIR_BuildVectorOp : GMIR_Op<"build_vector", [Pure]> {
   let summary = "Builds a vector from scalar elements, mirroring GlobalISel's G_BUILD_VECTOR";
   let description = [{
-    Emitted only by GMIRLegalizer's FewerElementsScalarizePattern, to
-    reassemble a scalarized vector op's per-lane results into a single
-    vector. Distinct from `gmir.merge` (concatenates scalars into a wider
+    Emitted only by GMIRLegalizer's shared rewriteFewerElements helper
+    (called from AddSubLegalizePattern's/BitwiseLegalizePattern's/
+    MulLegalizePattern's FewerElements dispatch case), to reassemble a
+    scalarized vector op's per-lane results into a single vector.
+    Distinct from `gmir.merge` (concatenates scalars into a wider
     *scalar*, mirroring G_MERGE_VALUES): real GlobalISel itself uses a
     different opcode here (MachineIRBuilder::getOpcodeForMerge picks
     G_BUILD_VECTOR specifically for a vector destination with scalar
