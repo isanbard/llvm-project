@@ -571,6 +571,16 @@ bool gmir::translate(func::FuncOp FuncOp, Function &F, MachineFunction &MF,
                      const BranchProbabilityInfo &BPI,
                      MachineIRBuilder &MIRBuilder) {
   const CallLowering *CLI = MF.getSubtarget().getCallLowering();
+  // getCallLowering() defaults to nullptr (TargetSubtargetInfo's base
+  // implementation) and isn't overridden by every in-tree target (e.g.
+  // SystemZ, Hexagon, Sparc, XCore, VE, LoongArch, NVPTX); -enable-mlir-isel
+  // has no target allowlist, so a null CLI here is a real, reachable case,
+  // not a should-never-happen one -- same graceful-fallback treatment as
+  // GMIRLegalizerInfoAdapter's null LegalizerInfo* handling
+  // (GMIRLegalizer.cpp), and exactly what this function's own header doc
+  // comment already promises callers.
+  if (!CLI)
+    return false;
 
   FunctionLoweringInfo FuncInfo;
   FuncInfo.clear();
