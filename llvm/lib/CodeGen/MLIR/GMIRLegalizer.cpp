@@ -64,6 +64,8 @@ template <> unsigned getGenericOpcode<gmir::MulOp>() {
 /// match and legalize() is a no-op, same graceful-fallback shape as every
 /// other failure path in this pipeline.
 class GMIRLegalizerInfoAdapter {
+  const LegalizerInfo *LI;
+
 public:
   explicit GMIRLegalizerInfoAdapter(const LegalizerInfo *LI) : LI(LI) {}
 
@@ -72,10 +74,9 @@ public:
       return LegalizeActionStep(LegalizeActions::Legal, 0, LLT{});
     return LI->getAction(LegalityQuery(Opcode, Types));
   }
-
-private:
-  const LegalizerInfo *LI;
 };
+
+} // namespace
 
 /// Returns {NarrowTy, NumParts} if Step (the op's single, already-computed
 /// LegalizeActionStep -- see each merged pattern's matchAndRewrite below,
@@ -89,7 +90,7 @@ private:
 /// split, and if so what to split into" check before their per-op-family
 /// rewrite logic (carry-chained vs. independent-chunk vs. schoolbook mul)
 /// diverges.
-std::optional<std::pair<LLT, unsigned>>
+static std::optional<std::pair<LLT, unsigned>>
 getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy) {
   if (Step.Action != LegalizeActions::NarrowScalar)
     return std::nullopt;
@@ -121,7 +122,7 @@ getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy) {
 /// getExactNarrowScalarSplit) only needs to change one place, not one per
 /// pattern.
 template <typename OpTy>
-std::pair<gmir::UnmergeOp, gmir::UnmergeOp>
+static std::pair<gmir::UnmergeOp, gmir::UnmergeOp>
 unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
                       gmir::LLTType NarrowGTy, unsigned NumParts) {
   SmallVector<mlir::Type, 4> NarrowResultTypes(NumParts, NarrowGTy);
@@ -131,25 +132,6 @@ unmergeNarrowOperands(PatternRewriter &Rewriter, OpTy Op, Location Loc,
       gmir::UnmergeOp::create(Rewriter, Loc, NarrowResultTypes, Op.getRhs());
   return {LhsParts, RhsParts};
 }
-
-/// Shared constructor/member boilerplate for every gmir-level
-/// legalization pattern below: each needs a GMIRLegalizerInfoAdapter and
-/// a DataLayout reference, and an identical 3-line constructor
-/// forwarding to OpRewritePattern<OpTy>. Factored into one base (rather
-/// than left duplicated across all 3 merged pattern classes) so a future
-/// change to what shared state these patterns carry only needs one edit.
-template <typename OpTy>
-class GMIRLegalizePatternBase : public OpRewritePattern<OpTy> {
-public:
-  GMIRLegalizePatternBase(MLIRContext *Context,
-                          GMIRLegalizerInfoAdapter Adapter,
-                          const llvm::DataLayout &DL)
-      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
-
-protected:
-  GMIRLegalizerInfoAdapter Adapter;
-  const llvm::DataLayout &DL;
-};
 
 /// Shared WidenScalar rewrite body for `G_ADD`/`G_AND`/`G_MUL`/`G_OR`/
 /// `G_XOR`/`G_SUB` (LegalizerHelper.cpp's widenScalar switch: any-extend
@@ -165,7 +147,7 @@ protected:
 /// re-query the same LegalizerInfo rule table a second time for the same
 /// op.
 template <typename OpTy>
-void rewriteWidenScalar(OpTy Op, PatternRewriter &Rewriter, LLT WideTy) {
+static void rewriteWidenScalar(OpTy Op, PatternRewriter &Rewriter, LLT WideTy) {
   auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
   MLIRContext *Context = Rewriter.getContext();
   gmir::LLTType WideGTy = gmir::convertToGMIRType(*Context, WideTy);
@@ -189,9 +171,9 @@ void rewriteWidenScalar(OpTy Op, PatternRewriter &Rewriter, LLT WideTy) {
 /// still-vector Step.NewType means this is FewerElements's other flavor
 /// (sub-vector splitting), out of scope here same as before.
 template <typename OpTy>
-bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
-                          LegalizeActionStep Step, LLT DstTy,
-                          gmir::LLTType DstGTy) {
+static bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
+                                 LegalizeActionStep Step, LLT DstTy,
+                                 gmir::LLTType DstGTy) {
   if (Step.Action != LegalizeActions::FewerElements || Step.NewType.isVector())
     return false;
 
@@ -212,6 +194,27 @@ bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
   Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
   return true;
 }
+
+namespace {
+
+/// Shared constructor/member boilerplate for every gmir-level
+/// legalization pattern below: each needs a GMIRLegalizerInfoAdapter and
+/// a DataLayout reference, and an identical 3-line constructor
+/// forwarding to OpRewritePattern<OpTy>. Factored into one base (rather
+/// than left duplicated across all 3 merged pattern classes) so a future
+/// change to what shared state these patterns carry only needs one edit.
+template <typename OpTy>
+class GMIRLegalizePatternBase : public OpRewritePattern<OpTy> {
+protected:
+  GMIRLegalizerInfoAdapter Adapter;
+  const llvm::DataLayout &DL;
+
+public:
+  GMIRLegalizePatternBase(MLIRContext *Context,
+                          GMIRLegalizerInfoAdapter Adapter,
+                          const llvm::DataLayout &DL)
+      : OpRewritePattern<OpTy>(Context), Adapter(Adapter), DL(DL) {}
+};
 
 /// Merges what used to be two separately-registered, separately-matching
 /// patterns -- NarrowScalar (LegalizerHelper::narrowScalarAddSub's exact

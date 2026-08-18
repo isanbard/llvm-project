@@ -128,8 +128,7 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override {
     mlir::OwningOpRef<mlir::ModuleOp> Module(
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
-    mlir::func::FuncOp FuncOp =
-        gmir::importFunction(*Module, MF.getFunction());
+    mlir::func::FuncOp FuncOp = gmir::importFunction(*Module, MF.getFunction());
 
     if (!FuncOp || !gmir::legalize(FuncOp, MF, PatternCache)) {
       // Outside the supported subset: defer to the existing selector, same

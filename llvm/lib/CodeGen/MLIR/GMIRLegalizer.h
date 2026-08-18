@@ -60,15 +60,14 @@ namespace gmir {
 /// capture a *different*, possibly-already-destroyed Module's
 /// DataLayout.
 class LegalizerPatternCache {
+  llvm::DenseMap<std::pair<const LegalizerInfo *, const llvm::DataLayout *>,
+                 mlir::FrozenRewritePatternSet>
+      Cache;
+
 public:
   const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context,
                                            const LegalizerInfo *LI,
                                            const llvm::DataLayout &DL);
-
-private:
-  llvm::DenseMap<std::pair<const LegalizerInfo *, const llvm::DataLayout *>,
-                 mlir::FrozenRewritePatternSet>
-      Cache;
 };
 
 /// Rewrites FuncOp in place. Returns false only on an unrecoverable error

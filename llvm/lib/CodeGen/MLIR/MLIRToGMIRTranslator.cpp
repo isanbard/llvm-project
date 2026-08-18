@@ -27,6 +27,7 @@ using namespace llvm;
 using namespace mlir;
 
 namespace {
+
 /// Bridges a `gmir`-only mlir::func::FuncOp into MF's MachineIR.
 ///
 /// Two-pass structure mirrors GlobalISel::IRTranslator (see
@@ -44,6 +45,16 @@ namespace {
 /// critical-edge splitting and multi-edge predecessors, which this
 /// (structured, non-critical-edge) subset doesn't need.
 class GMIRToMIRWalker {
+  MachineFunction &MF;
+  MachineIRBuilder &MIRBuilder;
+  const CallLowering &CLI;
+  const BranchProbabilityInfo &BPI;
+  const llvm::DataLayout &DL;
+  llvm::DenseMap<mlir::Value, Register> ValueToReg;
+  llvm::DenseMap<Block *, MachineBasicBlock *> BlockMap;
+  llvm::DenseMap<Block *, SmallVector<MachineInstr *, 4>> SkeletonPhis;
+  SmallVector<SmallVector<Register, 1>, 8> ArgRegStorage;
+
 public:
   GMIRToMIRWalker(MachineFunction &MF, MachineIRBuilder &MIRBuilder,
                   const CallLowering &CLI, const BranchProbabilityInfo &BPI)
@@ -62,15 +73,14 @@ public:
     // heuristics (e.g. loop-header alignment) see the same IR linkage
     // GlobalISel's own pipeline does -- confirmed by diffing output
     // against -global-isel, which was otherwise identical without this.
-    {
-      auto IRBlockIt = F.begin();
-      for (Block &BB : FuncOp.getFunctionBody()) {
-        BasicBlock &IRBB = *IRBlockIt++;
-        MachineBasicBlock *MBB = MF.CreateMachineBasicBlock(&IRBB);
-        MF.push_back(MBB);
-        BlockMap[&BB] = MBB;
-      }
+    auto IRBlockIt = F.begin();
+    for (Block &BB : FuncOp.getFunctionBody()) {
+      BasicBlock &IRBB = *IRBlockIt++;
+      MachineBasicBlock *MBB = MF.CreateMachineBasicBlock(&IRBB);
+      MF.push_back(MBB);
+      BlockMap[&BB] = MBB;
     }
+
     for (Block &BB : FuncOp.getFunctionBody()) {
       if (&BB == &EntryBB)
         continue;
@@ -96,7 +106,7 @@ public:
     // then F's remaining blocks in F's own iteration order), so a plain
     // parallel walk recovers each mlir::Block's original llvm::BasicBlock
     // (needed by lowerReturn, which wants the IR-level `ret`'s operand).
-    auto IRBlockIt = F.begin();
+    IRBlockIt = F.begin();
     for (Block &BB : FuncOp.getFunctionBody()) {
       BasicBlock &IRBB = *IRBlockIt++;
       MIRBuilder.setMBB(*BlockMap[&BB]);
@@ -121,7 +131,7 @@ public:
 
 private:
   bool lowerFormalArguments(func::FuncOp FuncOp, Function &F,
-                             FunctionLoweringInfo &FuncInfo) {
+                            FunctionLoweringInfo &FuncInfo) {
     // Stable storage for the ArrayRef<Register>s CallLowering expects --
     // one single-element vector per argument (no multi-register/aggregate
     // args in the current scalar-integer-only subset).
@@ -141,7 +151,7 @@ private:
   }
 
   bool lowerReturn(func::ReturnOp Ret, BasicBlock &IRBB,
-                    FunctionLoweringInfo &FuncInfo) {
+                   FunctionLoweringInfo &FuncInfo) {
     SmallVector<Register, 1> RetRegs;
     if (Ret.getNumOperands() == 1)
       RetRegs.push_back(ValueToReg.lookup(Ret.getOperand(0)));
@@ -150,6 +160,7 @@ private:
     // re-fetch it directly from IRBB (the llvm::BasicBlock this mlir::Block
     // was imported from) rather than threading provenance through gmir.
     auto *OrigRet = cast<ReturnInst>(IRBB.getTerminator());
+
     // CallLowering::lowerReturn is overloaded: a 4-arg version (base class
     // default body: `return false;`) and a 5-arg version taking a trailing
     // SwiftErrorVReg (base class default: delegates to the 4-arg one when
@@ -165,19 +176,18 @@ private:
                            FuncInfo, /*SwiftErrorVReg=*/Register());
   }
 
-  bool translateBr(gmir::BrOp Br, MachineBasicBlock *CurMBB,
-                    BasicBlock &IRBB) {
+  bool translateBr(gmir::BrOp Br, MachineBasicBlock *CurMBB, BasicBlock &IRBB) {
     Block *DestBB = Br.getDest();
     MachineBasicBlock *DestMBB = BlockMap[DestBB];
     MIRBuilder.buildBr(*DestMBB);
-    CurMBB->addSuccessor(DestMBB,
-                          BPI.getEdgeProbability(&IRBB, DestMBB->getBasicBlock()));
+    CurMBB->addSuccessor(
+        DestMBB, BPI.getEdgeProbability(&IRBB, DestMBB->getBasicBlock()));
     patchPhis(DestBB, Br.getDestOperands(), CurMBB);
     return true;
   }
 
   bool translateCondBr(gmir::CondBrOp Br, MachineBasicBlock *CurMBB,
-                        BasicBlock &IRBB) {
+                       BasicBlock &IRBB) {
     Register CondReg = ValueToReg.lookup(Br.getCondition());
     Block *TrueBB = Br.getTrueDest();
     Block *FalseBB = Br.getFalseDest();
@@ -191,10 +201,10 @@ private:
     // they would for GlobalISel-selected code.
     MIRBuilder.buildBrCond(CondReg, *TrueMBB);
     MIRBuilder.buildBr(*FalseMBB);
-    CurMBB->addSuccessor(TrueMBB,
-                          BPI.getEdgeProbability(&IRBB, TrueMBB->getBasicBlock()));
-    CurMBB->addSuccessor(FalseMBB,
-                          BPI.getEdgeProbability(&IRBB, FalseMBB->getBasicBlock()));
+    CurMBB->addSuccessor(
+        TrueMBB, BPI.getEdgeProbability(&IRBB, TrueMBB->getBasicBlock()));
+    CurMBB->addSuccessor(
+        FalseMBB, BPI.getEdgeProbability(&IRBB, FalseMBB->getBasicBlock()));
     patchPhis(TrueBB, Br.getTrueDestOperands(), CurMBB);
     patchPhis(FalseBB, Br.getFalseDestOperands(), CurMBB);
     return true;
@@ -209,6 +219,7 @@ private:
     ArrayRef<MachineInstr *> Skeletons = SkeletonPhis[DestBB];
     assert(Skeletons.size() == Operands.size() &&
            "gmir.br/brcond operand count must match dest block arg count");
+
     for (auto [Skeleton, Operand] : zip(Skeletons, Operands)) {
       Register Reg = ValueToReg.lookup(Operand);
       MachineInstrBuilder(MF, Skeleton).addUse(Reg).addMBB(PredMBB);
@@ -224,7 +235,8 @@ private:
       // 64 bits (I64Attr), regardless of the actual !gmir.llt width, so it
       // must be truncated back down here -- buildConstant asserts the
       // APInt's bit width matches Ty exactly.
-      APInt Val = ConstOp.getValueAttr().getValue().trunc(Ty.getScalarSizeInBits());
+      APInt Val =
+          ConstOp.getValueAttr().getValue().trunc(Ty.getScalarSizeInBits());
       auto MIB = MIRBuilder.buildConstant(Ty, Val);
       ValueToReg[ConstOp.getResult()] = MIB.getReg(0);
       return true;
@@ -257,9 +269,8 @@ private:
     GMIR_BINOP_CASE(AndOp, MIRBuilder.buildAnd(Ty, LHS, RHS))
     GMIR_BINOP_CASE(OrOp, MIRBuilder.buildOr(Ty, LHS, RHS))
     GMIR_BINOP_CASE(XorOp, MIRBuilder.buildXor(Ty, LHS, RHS))
-    GMIR_BINOP_CASE(SDivOp,
-                     MIRBuilder.buildInstr(TargetOpcode::G_SDIV, {Ty},
-                                           {LHS, RHS}))
+    GMIR_BINOP_CASE(
+        SDivOp, MIRBuilder.buildInstr(TargetOpcode::G_SDIV, {Ty}, {LHS, RHS}))
 #undef GMIR_BINOP_CASE
 
     // gmir.uaddo/uadde/usubo/usube -> G_U{ADD,SUB}{O,E}: emitted only by
@@ -328,9 +339,11 @@ private:
         DstRegs.push_back(
             MIRBuilder.getMRI()->createGenericVirtualRegister(Ty));
       }
+
       MIRBuilder.buildUnmerge(DstRegs, SrcReg);
       for (auto [Dst, Reg] : zip(Unmerge.getDsts(), DstRegs))
         ValueToReg[Dst] = Reg;
+
       return true;
     }
 
@@ -338,6 +351,7 @@ private:
       SmallVector<Register, 4> SrcRegs;
       for (mlir::Value Src : Merge.getSrcs())
         SrcRegs.push_back(ValueToReg.lookup(Src));
+
       LLT Ty = convertLLT(cast<gmir::LLTType>(Merge.getResult().getType()), DL);
       Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
       MIRBuilder.buildMergeValues(Res, SrcRegs);
@@ -357,6 +371,7 @@ private:
       SmallVector<Register, 4> SrcRegs;
       for (mlir::Value Src : BuildVector.getSrcs())
         SrcRegs.push_back(ValueToReg.lookup(Src));
+
       LLT Ty = convertLLT(
           cast<gmir::LLTType>(BuildVector.getResult().getType()), DL);
       Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
@@ -403,8 +418,10 @@ private:
       MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
       if (Load.getIsInvariant())
         ExtraFlags |= MachineMemOperand::MOInvariant;
+
       if (Load.getIsNonTemporal())
         ExtraFlags |= MachineMemOperand::MONonTemporal;
+
       MachineMemOperand *MMO = buildMMO(
           MachineMemOperand::MOLoad | ExtraFlags, Ty,
           Load.getAlignAttr().getInt(), Load.getOrderingAttr().getInt(),
@@ -421,6 +438,7 @@ private:
       MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
       if (Store.getIsNonTemporal())
         ExtraFlags |= MachineMemOperand::MONonTemporal;
+
       MachineMemOperand *MMO = buildMMO(
           MachineMemOperand::MOStore | ExtraFlags, Ty,
           Store.getAlignAttr().getInt(), Store.getOrderingAttr().getInt(),
@@ -434,6 +452,7 @@ private:
       Register OffReg = ValueToReg.lookup(PtrAdd.getOffset());
       LLT Ty =
           convertLLT(cast<gmir::LLTType>(PtrAdd.getResult().getType()), DL);
+
       unsigned Flags = 0;
       if (PtrAdd.getNoUWrap())
         Flags |= MachineInstr::MIFlag::NoUWrap;
@@ -441,6 +460,7 @@ private:
         Flags |= MachineInstr::MIFlag::NoUSWrap;
       if (PtrAdd.getInBounds())
         Flags |= MachineInstr::MIFlag::InBounds;
+
       auto MIB = MIRBuilder.buildPtrAdd(Ty, PtrReg, OffReg, Flags);
       ValueToReg[PtrAdd.getResult()] = MIB.getReg(0);
       return true;
@@ -549,22 +569,13 @@ private:
     if (IsVolatile)
       Flags |= MachineMemOperand::MOVolatile;
 
-    return MF.getMachineMemOperand(
-        MachinePointerInfo(), Flags, Ty, Align(AlignBytes), MMOMetadata(),
-        static_cast<SyncScope::ID>(SyncScopeVal),
-        static_cast<AtomicOrdering>(OrderingVal));
+    return MF.getMachineMemOperand(MachinePointerInfo(), Flags, Ty,
+                                   Align(AlignBytes), MMOMetadata(),
+                                   static_cast<SyncScope::ID>(SyncScopeVal),
+                                   static_cast<AtomicOrdering>(OrderingVal));
   }
-
-  MachineFunction &MF;
-  MachineIRBuilder &MIRBuilder;
-  const CallLowering &CLI;
-  const BranchProbabilityInfo &BPI;
-  const llvm::DataLayout &DL;
-  llvm::DenseMap<mlir::Value, Register> ValueToReg;
-  llvm::DenseMap<Block *, MachineBasicBlock *> BlockMap;
-  llvm::DenseMap<Block *, SmallVector<MachineInstr *, 4>> SkeletonPhis;
-  SmallVector<SmallVector<Register, 1>, 8> ArgRegStorage;
 };
+
 } // namespace
 
 bool gmir::translate(func::FuncOp FuncOp, Function &F, MachineFunction &MF,

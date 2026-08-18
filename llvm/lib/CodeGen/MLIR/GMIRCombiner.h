@@ -52,11 +52,10 @@ namespace gmir {
 /// the whole pattern set on it. Revisit this simplification if a future
 /// slice's patterns turn out to need per-target-keyed caching after all.
 class CombinerPatternCache {
+  std::optional<mlir::FrozenRewritePatternSet> Cache;
+
 public:
   const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context);
-
-private:
-  std::optional<mlir::FrozenRewritePatternSet> Cache;
 };
 
 /// Rewrites FuncOp in place: applies PatternCache's patterns (plus, for

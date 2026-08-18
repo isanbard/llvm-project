@@ -36,7 +36,6 @@ using namespace llvm::gmir;
 // on via matchPattern(op, m_Constant()).
 OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) { return getValueAttr(); }
 
-namespace {
 // gmir.constant always stores its value sign-extended into a 64-bit
 // I64Attr regardless of the op's real (possibly narrower) width -- see
 // GMIR_ConstantOp's doc comment and MLIRToGMIRTranslator.cpp's matching
@@ -48,7 +47,8 @@ namespace {
 // sign-extended values (rather than truncating first) would silently
 // skip the real op's actual-width wraparound (e.g. i32 INT_MAX + 1
 // must wrap at 32 bits, not 64).
-std::optional<APInt> getGMIRConstOperand(mlir::Attribute Attr, unsigned Width) {
+static std::optional<APInt> getGMIRConstOperand(mlir::Attribute Attr,
+                                                unsigned Width) {
   auto IntAttr = dyn_cast_or_null<IntegerAttr>(Attr);
   if (!IntAttr)
     return std::nullopt;
@@ -59,10 +59,9 @@ std::optional<APInt> getGMIRConstOperand(mlir::Attribute Attr, unsigned Width) {
 // Inverse of getGMIRConstOperand: packages Value (already truncated to
 // the op's real width) as the 64-bit-sign-extended I64Attr
 // gmir.constant expects.
-IntegerAttr makeGMIRConstAttr(MLIRContext *Context, APInt Value) {
+static IntegerAttr makeGMIRConstAttr(MLIRContext *Context, APInt Value) {
   return IntegerAttr::get(IntegerType::get(Context, 64), Value.sext(64));
 }
-} // namespace
 
 // The tier-1 DAGCombiner-style algebraic identity folds below (M5 slice
 // 1, see ~/llvm/mlir_instruction_selection_plan.md) each reduce a
@@ -256,7 +255,7 @@ Block *BrOp::getSuccessorForOperands(ArrayRef<mlir::Attribute>) {
 mlir::SuccessorOperands CondBrOp::getSuccessorOperands(unsigned index) {
   assert(index < 2 && "invalid successor index");
   return mlir::SuccessorOperands(index == 0 ? getTrueDestOperandsMutable()
-                                             : getFalseDestOperandsMutable());
+                                            : getFalseDestOperandsMutable());
 }
 
 Block *CondBrOp::getSuccessorForOperands(ArrayRef<mlir::Attribute> operands) {
