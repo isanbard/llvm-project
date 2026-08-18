@@ -25,6 +25,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Support/Alignment.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -569,7 +570,14 @@ private:
       llvm::Value *Idx = GTI.getOperand();
       if (llvm::StructType *StTy = GTI.getStructTypeOrNull()) {
         unsigned Field = cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
-        Offset += DL->getStructLayout(StTy)->getElementOffset(Field);
+        // Same silent-corruption bug class as importAlloca's overflow fix:
+        // a plain += could wrap Offset for a pathological but constructible
+        // GEP chain (e.g. deeply nested/huge structs), producing a wrong,
+        // in-bounds-looking offset instead of failing closed. Bail to
+        // fallback on overflow rather than emit a miscompile.
+        uint64_t FieldOff = DL->getStructLayout(StTy)->getElementOffset(Field);
+        if (AddOverflow(Offset, static_cast<int64_t>(FieldOff), Offset))
+          return false;
         continue;
       }
       // getSequentialElementStride returns a TypeSize; a scalable stride
@@ -583,7 +591,13 @@ private:
       uint64_t ElementSize = ElementSizeTS.getFixedValue();
       if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
         if (auto Val = CI->getValue().trySExtValue()) {
-          Offset += ElementSize * *Val;
+          // Same overflow concern as the struct-offset case above: a large
+          // constant array index times a large element size can overflow
+          // the product, and/or overflow Offset when added in.
+          int64_t Prod;
+          if (MulOverflow(static_cast<int64_t>(ElementSize), *Val, Prod) ||
+              AddOverflow(Offset, Prod, Offset))
+            return false;
           continue;
         }
       }

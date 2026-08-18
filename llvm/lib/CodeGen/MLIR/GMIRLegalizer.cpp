@@ -175,6 +175,40 @@ void rewriteWidenScalar(OpTy Op, PatternRewriter &Rewriter, LLT WideTy) {
   Rewriter.replaceOpWithNewOp<gmir::TruncOp>(Op, DstGTy, WideRes.getResult());
 }
 
+/// Shared FewerElements rewrite body -- originally MulLegalizePattern-only
+/// (M4 slice 4's mul-scalarize scenario was the only one with a concrete
+/// motivating case), generalized here to every op family's merged pattern
+/// once it became clear the scalarize algorithm itself has nothing
+/// mul-specific about it: unmerge each vector operand into its scalar
+/// lanes, reapply OpTy per lane, reassemble via gmir.build_vector. Returns
+/// false (leaving Op untouched) when Step isn't a pure-scalarize
+/// FewerElements action -- see MulLegalizePattern's doc comment for why a
+/// still-vector Step.NewType means this is FewerElements's other flavor
+/// (sub-vector splitting), out of scope here same as before.
+template <typename OpTy>
+bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
+                          LegalizeActionStep Step, LLT DstTy,
+                          gmir::LLTType DstGTy) {
+  if (Step.Action != LegalizeActions::FewerElements || Step.NewType.isVector())
+    return false;
+
+  MLIRContext *Context = Rewriter.getContext();
+  gmir::LLTType LaneGTy = gmir::convertToGMIRType(*Context, Step.NewType);
+  unsigned NumLanes = DstTy.getNumElements();
+  Location Loc = Op.getLoc();
+  auto [LhsParts, RhsParts] =
+      unmergeNarrowOperands(Rewriter, Op, Loc, LaneGTy, NumLanes);
+
+  SmallVector<mlir::Value, 4> DstParts;
+  for (unsigned I = 0; I != NumLanes; ++I) {
+    auto Lane = OpTy::create(Rewriter, Loc, LaneGTy, LhsParts.getDsts()[I],
+                             RhsParts.getDsts()[I]);
+    DstParts.push_back(Lane.getResult());
+  }
+  Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
+  return true;
+}
+
 /// Merges what used to be two separately-registered, separately-matching
 /// patterns -- NarrowScalar (LegalizerHelper::narrowScalarAddSub's exact
 /// hi/lo+carry split algorithm, ported to build gmir ops instead of real
@@ -247,6 +281,9 @@ public:
       return success();
     }
 
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+      return success();
+
     return failure();
   }
 };
@@ -298,15 +335,19 @@ public:
       return success();
     }
 
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+      return success();
+
     return failure();
   }
 };
 
 /// Merges three formerly-separate patterns -- NarrowScalar, WidenScalar
-/// (see rewriteWidenScalar), and FewerElements -- for `gmir.mul` into one
-/// pattern, same one-getAction()-call-per-visit rationale as
-/// AddSubLegalizePattern/BitwiseLegalizePattern above, but for mul this
-/// collapses three redundant rule-table walks into one instead of two.
+/// (see rewriteWidenScalar), and FewerElements (see rewriteFewerElements)
+/// -- for `gmir.mul` into one pattern, same one-getAction()-call-per-visit
+/// rationale as AddSubLegalizePattern/BitwiseLegalizePattern above, but
+/// for mul this collapses three redundant rule-table walks into one
+/// instead of two.
 ///
 /// NarrowScalar case implements LegalizerHelper::narrowScalarMul/
 /// multiplyRegisters's algorithm, but only the NumParts == 2 case: at
@@ -326,21 +367,12 @@ public:
 /// bails explicitly on any other NumParts rather than assuming this can't
 /// happen.
 ///
-/// FewerElements case implements
-/// LegalizerHelper::fewerElementsVectorMultiEltType's pure-scalarize case
-/// (LegalizerHelper.cpp:5243-5310, reached via the G_MUL case block at
-/// 5691-5816): unmerge each vector operand into its scalar lanes, reapply
-/// gmir.mul per lane, reassemble via gmir.build_vector (mirrors
-/// G_BUILD_VECTOR, the real opcode buildMergeLikeInstr picks for a vector
-/// destination with scalar sources -- not G_MERGE_VALUES, which is
-/// scalar-dest-only). Bails when Step.NewType is still a vector:
-/// LegalizeMutations::scalarize's real implementation (`{TypeIdx,
-/// Query.Types[TypeIdx].getElementType()}`) always returns a bare scalar
-/// for pure scalarize, so a still-vector NewType means this is
-/// FewerElements's other flavor -- splitting into a narrower
-/// multi-element sub-vector, not full scalarization -- which is
-/// explicitly out of scope (left to the real downstream Legalizer, same
-/// graceful-fallback discipline as every unhandled action).
+/// FewerElements case: see rewriteFewerElements, shared with
+/// AddSubLegalizePattern/BitwiseLegalizePattern above -- originally
+/// mul-only (mirroring LegalizerHelper::fewerElementsVectorMultiEltType's
+/// pure-scalarize case, LegalizerHelper.cpp:5243-5310, reached via the
+/// G_MUL case block at 5691-5816), generalized once it became clear the
+/// scalarize algorithm has nothing mul-specific about it.
 class MulLegalizePattern : public GMIRLegalizePatternBase<gmir::MulOp> {
   using Base = GMIRLegalizePatternBase<gmir::MulOp>;
   using Base::Adapter;
@@ -396,25 +428,8 @@ public:
       return success();
     }
 
-    if (Step.Action == LegalizeActions::FewerElements &&
-        !Step.NewType.isVector()) {
-      MLIRContext *Context = Rewriter.getContext();
-      gmir::LLTType LaneGTy = gmir::convertToGMIRType(*Context, Step.NewType);
-      unsigned NumLanes = DstTy.getNumElements();
-      Location Loc = Op.getLoc();
-      auto [LhsParts, RhsParts] =
-          unmergeNarrowOperands(Rewriter, Op, Loc, LaneGTy, NumLanes);
-
-      SmallVector<mlir::Value, 4> DstParts;
-      for (unsigned I = 0; I != NumLanes; ++I) {
-        auto Lane =
-            gmir::MulOp::create(Rewriter, Loc, LaneGTy, LhsParts.getDsts()[I],
-                                RhsParts.getDsts()[I]);
-        DstParts.push_back(Lane.getResult());
-      }
-      Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
       return success();
-    }
 
     return failure();
   }

@@ -207,6 +207,13 @@ LogicalResult AnyExtOp::verify() {
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  // Width-only checks below don't by themselves rule out a vector operand
+  // paired with a scalar result (or a mismatched element count/scalability)
+  // -- both slip through undetected without an explicit shape check, since
+  // getScalarSizeInBits() only ever inspects the element width.
+  if (SrcTy.getNumElements() != ResTy.getNumElements() ||
+      SrcTy.getIsScalable() != ResTy.getIsScalable())
+    return emitOpError("vector shape must match between operand and result");
   if (ResTy.getScalarSizeInBits() <= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be wider than the operand");
   return success();
@@ -217,6 +224,11 @@ LogicalResult TruncOp::verify() {
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  // See AnyExtOp::verify() above for why this check is needed separately
+  // from the width checks.
+  if (SrcTy.getNumElements() != ResTy.getNumElements() ||
+      SrcTy.getIsScalable() != ResTy.getIsScalable())
+    return emitOpError("vector shape must match between operand and result");
   if (ResTy.getScalarSizeInBits() >= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be narrower than the operand");
   return success();

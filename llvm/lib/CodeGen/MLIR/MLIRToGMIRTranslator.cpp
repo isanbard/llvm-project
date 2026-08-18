@@ -484,28 +484,23 @@ private:
 
     // Regroup the flat leaf-operand list back into one ArrayRef<Register>
     // per original IR argument, using argLeafCounts. CallArgRegStorage
-    // provides stable storage for the ArrayRef<Register>s in ArgRegs,
-    // matching lowerFormalArguments's ArgRegStorage pattern -- including
-    // its reserve() call: without it, a call with more than 8 original
-    // arguments would grow CallArgRegStorage past its inline capacity
-    // mid-loop, move-relocating every already-pushed inner SmallVector
-    // (including any still using ITS OWN inline storage, i.e. every
-    // single-leaf-register argument) and dangling the ArrayRef<Register>s
-    // already captured into ArgRegs for those earlier arguments.
-    SmallVector<SmallVector<Register, 1>, 8> CallArgRegStorage;
-    CallArgRegStorage.reserve(Call.getArgLeafCounts().size());
+    // provides one flat, stable backing store for every ArgRegs slice --
+    // all leaf registers are pushed up front (reserve()'d to their exact
+    // final count, so no reallocation ever occurs mid-loop), then ArgRegs
+    // is built as a second pass of non-overlapping slices into it. Unlike
+    // a vector-of-vectors, there's no inner SmallVector whose own
+    // relocation could dangle an already-captured ArrayRef<Register>.
+    SmallVector<Register, 8> CallArgRegStorage;
+    CallArgRegStorage.reserve(Call.getArgs().size());
+    for (mlir::Value Arg : Call.getArgs())
+      CallArgRegStorage.push_back(ValueToReg.lookup(Arg));
+
     SmallVector<ArrayRef<Register>, 8> ArgRegs;
-    // Call.getArgs() (an mlir::OperandRange) already supports O(1) random
-    // access -- indexed directly below rather than copied into a
-    // SmallVector first just to support that indexing.
-    mlir::OperandRange Args = Call.getArgs();
     unsigned FlatIdx = 0;
     for (int32_t Count : Call.getArgLeafCounts()) {
-      SmallVector<Register, 1> Regs;
-      for (int32_t I = 0; I != Count; ++I)
-        Regs.push_back(ValueToReg.lookup(Args[FlatIdx++]));
-      CallArgRegStorage.push_back(std::move(Regs));
-      ArgRegs.push_back(CallArgRegStorage.back());
+      ArgRegs.push_back(
+          ArrayRef<Register>(CallArgRegStorage).slice(FlatIdx, Count));
+      FlatIdx += Count;
     }
 
     if (!CLI.lowerCall(
