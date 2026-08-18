@@ -542,8 +542,8 @@ private:
     if (IsVolatile)
       Flags |= MachineMemOperand::MOVolatile;
     return MF.getMachineMemOperand(
-        MachinePointerInfo(), Flags, Ty, Align(AlignBytes), AAMDNodes(),
-        /*Ranges=*/nullptr, static_cast<SyncScope::ID>(SyncScopeVal),
+        MachinePointerInfo(), Flags, Ty, Align(AlignBytes), MMOMetadata(),
+        static_cast<SyncScope::ID>(SyncScopeVal),
         static_cast<AtomicOrdering>(OrderingVal));
   }
 
