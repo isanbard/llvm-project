@@ -141,3 +141,32 @@ define i32 @const_add_overflow(i32 %unused) {
 ; CHECK-NOT: gmir.add
 ; CHECK: gmir.constant -2147483648
 ; CHECK: return
+
+; M5 slice 2's first real OpRewritePattern (MulNegOneToSubPattern, not
+; a fold()) -- see combine-identities.ll for the full rationale. Unlike
+; that file's mul_neg_one, this one's byte-diff RUN lines above DO hold
+; here: confirmed empirically that AArch64's real O0-equivalent
+; combiner (AArch64O0PreLegalizerCombiner) already does this exact
+; mul-by-negative-one-to-negate simplification independently, same
+; masking risk as every other identity in this file -- the
+; -print-gmir-after-combine FileCheck below is still the real proof
+; gmir's own pattern ran, not the byte-diff alone.
+define i32 @mul_neg_one(i32 %x) {
+  %r = mul i32 %x, -1
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @mul_neg_one
+; CHECK-NOT: gmir.mul
+; CHECK: gmir.constant 0
+; CHECK: gmir.sub
+; CHECK: return
+
+define i32 @mul_neg_one_lhs(i32 %x) {
+  %r = mul i32 -1, %x
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @mul_neg_one_lhs
+; CHECK-NOT: gmir.mul
+; CHECK: gmir.constant 0
+; CHECK: gmir.sub
+; CHECK: return

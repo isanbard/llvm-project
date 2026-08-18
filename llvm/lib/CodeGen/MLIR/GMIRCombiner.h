@@ -12,18 +12,20 @@
 // implemented as the arithmetic ops' own fold() methods (see
 // IR/GMIRDialect.cpp), not as patterns registered here -- fold() fires
 // automatically wherever applyPatternsGreedily runs, which is all this
-// pass needs to do to exercise them. This file's own job for slice 1 is
-// just (a) providing the pipeline slot those fold()s actually run in,
-// and (b) wiring in CSE (mlir::eliminateCommonSubExpressions), a
-// distinct, complementary simplification fold() can't do on its own
-// (deduping genuinely-different-looking-but-equivalent ops, not
-// reducing a single op given its own operands). Later slices needing
-// genuine multi-op rewrites (which fold() can't express -- no new ops,
-// no restructuring) register real patterns into CombinerPatternCache,
-// the same OpRewritePattern<OpTy> shape GMIRLegalizer.h uses. See
+// pass needs to do to exercise them. This file's own job is (a)
+// providing the pipeline slot those fold()s actually run in, (b) wiring
+// in CSE (mlir::eliminateCommonSubExpressions), a distinct,
+// complementary simplification fold() can't do on its own (deduping
+// genuinely-different-looking-but-equivalent ops, not reducing a single
+// op given its own operands), and (c), starting with M5 slice 2, hosting
+// genuine multi-op rewrites fold() can't express -- no new ops, no
+// restructuring -- as real OpRewritePattern<OpTy> classes registered
+// into CombinerPatternCache, the same shape GMIRLegalizer.h uses (e.g.
+// slice 2's MulNegOneToSubPattern: `mul x, -1 -> sub(0, x)`, which needs
+// a brand-new gmir.sub op fold() can't emit). See
 // ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
 // design, including why -print-gmir-after-combine (not just the usual
-// -global-isel asm-diff) is the real proof this pass's fold()s ran on
+// -global-isel asm-diff) is the real proof this pass's own code ran on
 // AArch64 specifically (a real downstream GICombiner pass runs there
 // even at -O0-equivalent, unlike X86).
 //
@@ -57,13 +59,13 @@ private:
   std::optional<mlir::FrozenRewritePatternSet> Cache;
 };
 
-/// Rewrites FuncOp in place: applies PatternCache's patterns (currently
-/// none registered -- slice 1's identities are op fold()s, which the
-/// greedy driver invokes unconditionally regardless of what's in the
-/// pattern set, see IR/GMIRDialect.cpp) via applyPatternsGreedily, then
-/// runs CSE once. Returns false only if applyPatternsGreedily itself
-/// fails (e.g. non-convergence) -- mirrors gmir::legalize()'s
-/// fallible-step convention used throughout this pipeline's caller,
+/// Rewrites FuncOp in place: applies PatternCache's patterns (plus, for
+/// every op, its own fold() -- the greedy driver invokes fold()
+/// unconditionally regardless of what's in the pattern set, see
+/// IR/GMIRDialect.cpp) via applyPatternsGreedily, then runs CSE once.
+/// Returns false only if applyPatternsGreedily itself fails (e.g.
+/// non-convergence) -- mirrors gmir::legalize()'s fallible-step
+/// convention used throughout this pipeline's caller,
 /// MLIRInstructionSelect.cpp.
 bool combine(mlir::func::FuncOp FuncOp, CombinerPatternCache &PatternCache);
 

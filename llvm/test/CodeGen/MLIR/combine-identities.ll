@@ -23,6 +23,23 @@
 ; to correct final codegen) -- mirroring vector-scalarize.ll's precedent
 ; of FileChecking final assembly directly when the usual oracle doesn't
 ; apply.
+;
+; mul_neg_one/mul_neg_one_lhs (M5 slice 2) are this file's first case
+; exercising a genuine OpRewritePattern (MulNegOneToSubPattern,
+; GMIRCombiner.cpp) rather than a fold() -- `mul x, -1 -> sub(0, x)`
+; needs a brand-new gmir.sub op, which fold() can't emit (it can only
+; return an existing operand or a constant). Confirmed empirically,
+; not assumed, that these two functions' divergence from plain
+; -global-isel is asymmetric: X86's own InstructionSelect TableGen
+; patterns already recognize `mul x, -1` (constant on the right) as a
+; NEG idiom on their own, with zero combiner involved, so
+; mul_neg_one's byte-diff against plain -global-isel would actually be
+; empty too -- but `mul -1, x` (constant on the *left*) hits no such
+; pattern (plain -global-isel emits a real imull there), unlike
+; MulNegOneToSubPattern, which explicitly checks both operand orders.
+; Both functions are FileChecked the same way regardless, for
+; consistency with the rest of this file and because the ASM checks
+; don't depend on which specific reason the divergence exists for.
 
 define i32 @add_zero(i32 %x) {
   %r = add i32 %x, 0
@@ -181,3 +198,29 @@ define i32 @const_add_overflow(i32 %unused) {
 ; GMIR: return
 ; ASM-LABEL: const_add_overflow:
 ; ASM: movl $-2147483648, %eax
+
+define i32 @mul_neg_one(i32 %x) {
+  %r = mul i32 %x, -1
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @mul_neg_one
+; GMIR-NOT: gmir.mul
+; GMIR: gmir.constant 0
+; GMIR: gmir.sub
+; GMIR: return
+; ASM-LABEL: mul_neg_one:
+; ASM-NOT: imull
+; ASM: negl %eax
+
+define i32 @mul_neg_one_lhs(i32 %x) {
+  %r = mul i32 -1, %x
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @mul_neg_one_lhs
+; GMIR-NOT: gmir.mul
+; GMIR: gmir.constant 0
+; GMIR: gmir.sub
+; GMIR: return
+; ASM-LABEL: mul_neg_one_lhs:
+; ASM-NOT: imull
+; ASM: negl %eax
