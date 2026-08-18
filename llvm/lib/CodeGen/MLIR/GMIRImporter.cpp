@@ -55,14 +55,17 @@ gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
     // never validated either.
     if (IntTy->getBitWidth() > 64)
       return {};
+
     return gmir::LLTType::get(&Context, IntTy->getBitWidth(),
                               /*numElements=*/0, /*addressSpace=*/0,
                               /*isScalable=*/false);
   }
+
   if (auto *PtrTy = dyn_cast<llvm::PointerType>(Ty))
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, PtrTy->getAddressSpace(),
                               /*isScalable=*/false);
+
   // Fixed-width integer vectors only (M4 slice 4's vector-scalarization
   // scope): the plain `dyn_cast<llvm::IntegerType>` below already safely
   // rejects vector-of-pointer (llvm::VectorType::isValidElementType
@@ -74,10 +77,12 @@ gmir::LLTType convertType(MLIRContext &Context, llvm::Type *Ty) {
     auto *EltTy = dyn_cast<llvm::IntegerType>(VecTy->getElementType());
     if (!EltTy || EltTy->getBitWidth() > 64)
       return {};
+
     return gmir::LLTType::get(&Context, EltTy->getBitWidth(),
                               VecTy->getNumElements(), /*addressSpace=*/0,
                               /*isScalable=*/false);
   }
+
   return {};
 }
 
@@ -111,12 +116,15 @@ bool computeGMIRLeafTypes(MLIRContext &Context, const llvm::DataLayout &DL,
   for (auto [LeafIRTy, LeafOffset] : zip(LeafIRTypes, LeafOffsets)) {
     if (LeafOffset.isScalable())
       return false;
+
     gmir::LLTType LeafTy = convertType(Context, LeafIRTy);
     if (!LeafTy)
       return false;
+
     Types.push_back(LeafTy);
     Offsets.push_back(LeafOffset.getFixedValue());
   }
+
   return true;
 }
 
@@ -138,6 +146,7 @@ public:
   /// Returns false the moment an unsupported construct is seen.
   bool import(Function &F, func::FuncOp FuncOp) {
     DL = &F.getParent()->getDataLayout();
+
     // Memoized constants (see getOperands) are materialized at a fixed,
     // growing-forward cursor at the very front of the entry block, exactly
     // like IRTranslator's own dedicated EntryBuilder -- this guarantees
@@ -163,13 +172,16 @@ public:
     for (BasicBlock &BB : F) {
       if (&BB == &F.getEntryBlock())
         continue;
+
       SmallVector<mlir::Type> ArgTypes;
       for (PHINode &PN : BB.phis()) {
         gmir::LLTType Ty = convertType(Context, PN.getType());
         if (!Ty)
           return false;
+
         ArgTypes.push_back(Ty);
       }
+
       auto *MLIRBB = new Block();
       FuncOp.getBody().push_back(MLIRBB);
       SmallVector<mlir::Location> Locs(ArgTypes.size(), Builder.getUnknownLoc());
@@ -187,6 +199,7 @@ public:
       if (!importBlockBody(BB))
         return false;
     }
+
     return true;
   }
 
@@ -195,51 +208,69 @@ private:
     for (Instruction &I : BB) {
       if (isa<PHINode>(I))
         continue; // handled in pass 1
+
       if (auto *Ret = dyn_cast<ReturnInst>(&I))
         return importReturn(*Ret);
+
       // This checkout splits LLVM upstream's single BranchInst into
       // UncondBrInst/CondBrInst (two distinct opcodes/classes) rather than
       // one class with isConditional() -- see Instruction.def's
       // HANDLE_TERM_INST(UncondBr/CondBr) entries.
       if (auto *Br = dyn_cast<UncondBrInst>(&I))
         return importUncondBr(*Br);
+
       if (auto *Br = dyn_cast<CondBrInst>(&I))
         return importCondBr(*Br);
+
       if (auto *ICmp = dyn_cast<ICmpInst>(&I)) {
         if (!importICmp(*ICmp))
           return false;
+
         continue;
       }
+
       if (auto *BinOp = dyn_cast<BinaryOperator>(&I)) {
         if (!importBinaryOp(*BinOp))
           return false;
+
         continue;
       }
+
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
         if (!importAlloca(*AI))
           return false;
+
         continue;
       }
+
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
         if (!importLoad(*LI))
           return false;
+
         continue;
       }
+
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         if (!importStore(*SI))
           return false;
+
         continue;
       }
+
       if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         if (!importGEP(*GEP))
           return false;
+
         continue;
       }
+
       if (auto *CI = dyn_cast<CallInst>(&I)) {
         if (!importCall(*CI))
           return false;
+
         continue;
       }
+
       // Anything else (switches, casts, selects, invokes, ...) is out of
       // scope for this milestone slice -- fall back rather than
       // mistranslate. Note: `select` and `switch` are reachable even from
@@ -249,6 +280,7 @@ private:
       // `switch` before codegen ever sees the function.
       return false;
     }
+
     // Fell off the end without a terminator: malformed IR, shouldn't
     // happen, but bail gracefully rather than assert.
     return false;
@@ -258,6 +290,7 @@ private:
     gmir::LLTType ResTy = convertType(Context, BinOp.getType());
     if (!ResTy)
       return false;
+
     mlir::Value LHS, RHS;
     if (!getScalarOperand(BinOp.getOperand(0), LHS) ||
         !getScalarOperand(BinOp.getOperand(1), RHS))
@@ -299,10 +332,12 @@ private:
     gmir::LLTType ResTy = convertType(Context, ICmp.getType());
     if (!ResTy)
       return false;
+
     mlir::Value LHS, RHS;
     if (!getScalarOperand(ICmp.getOperand(0), LHS) ||
         !getScalarOperand(ICmp.getOperand(1), RHS))
       return false;
+
     auto Op = gmir::ICmpOp::create(
         Builder, Builder.getUnknownLoc(), ResTy,
         Builder.getI64IntegerAttr(static_cast<int64_t>(ICmp.getPredicate())),
@@ -316,6 +351,7 @@ private:
   bool importAlloca(AllocaInst &AI) {
     if (!AI.isStaticAlloca())
       return false;
+
     // isStaticAlloca() only checks the array-size operand is a constant
     // and the alloca is in the entry block -- it says nothing about
     // whether the *allocated type itself* is scalable (e.g. `alloca
@@ -327,9 +363,11 @@ private:
     // by vscale" -- a silent under-sized stack object, not a crash.
     if (AI.getAllocatedType()->isScalableTy())
       return false;
+
     gmir::LLTType ResTy = convertType(Context, AI.getType());
     if (!ResTy)
       return false;
+
     // getAllocationSize returns nullopt not just for a non-constant array
     // size (already excluded by isStaticAlloca() above), but also when
     // arraySize*elementSize itself overflows uint64_t (checkedMulUnsigned
@@ -344,6 +382,7 @@ private:
     std::optional<TypeSize> Size = AI.getAllocationSize(*DL);
     if (!Size)
       return false;
+
     // Matches IRTranslator::getOrCreateFrameIndex: always allocate at least
     // one byte.
     uint64_t SizeBytes = std::max<uint64_t>(Size->getKnownMinValue(), 1);
@@ -368,6 +407,7 @@ private:
                                  gmir::LLTType OffsetTy, uint64_t Offset) {
     if (Offset == 0)
       return BasePtr;
+
     auto ConstOp = gmir::ConstantOp::create(
         Builder, Builder.getUnknownLoc(), OffsetTy,
         Builder.getI64IntegerAttr(static_cast<int64_t>(Offset)));
@@ -390,11 +430,14 @@ private:
     SmallVector<uint64_t, 1> Offsets;
     if (!computeGMIRLeafTypes(Context, *DL, LI.getType(), LeafTypes, Offsets))
       return false;
+
     mlir::Value BasePtr;
     if (!getScalarOperand(LI.getPointerOperand(), BasePtr))
       return false;
+
     llvm::Type *PtrIRTy = LI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+
     // Unlike PtrTy (pointers always convert successfully -- convertType
     // has no width restriction for them), the pointer's index type is an
     // *integer* whose width is datalayout-defined, not statically
@@ -405,6 +448,7 @@ private:
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
     if (!OffsetTy)
       return false;
+
     // Mirrors TargetLoweringBase::getLoadMemOperandFlags's MOInvariant/
     // MONonTemporal derivation exactly -- see gmir.load's doc comment for
     // why MODereferenceable isn't modeled alongside these.
@@ -428,6 +472,7 @@ private:
           IsInvariant, IsNonTemporal);
       Results.push_back(Op.getResult());
     }
+
     ValueMap[&LI] = std::move(Results);
     return true;
   }
@@ -440,20 +485,24 @@ private:
     if (!computeGMIRLeafTypes(Context, *DL, SI.getValueOperand()->getType(),
                               LeafTypes, Offsets))
       return false;
+
     SmallVector<mlir::Value, 1> ValueLeaves;
     mlir::Value BasePtr;
     if (!getOperands(SI.getValueOperand(), ValueLeaves) ||
         ValueLeaves.size() != LeafTypes.size() ||
         !getScalarOperand(SI.getPointerOperand(), BasePtr))
       return false;
+
     llvm::Type *PtrIRTy = SI.getPointerOperand()->getType();
     gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+
     // See importLoad's identical check above for why OffsetTy (unlike
     // PtrTy) needs one -- its width is datalayout-defined, not
     // statically bounded.
     gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
     if (!OffsetTy)
       return false;
+
     // Mirrors TargetLoweringBase::getStoreMemOperandFlags's MONonTemporal
     // derivation exactly.
     mlir::UnitAttr IsNonTemporal = SI.hasMetadata(LLVMContext::MD_nontemporal)
@@ -471,6 +520,7 @@ private:
           SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
           IsNonTemporal);
     }
+
     return true;
   }
 
@@ -534,6 +584,7 @@ private:
 
     llvm::Type *OffsetIRTy = DL->getIndexType(GEP.getPointerOperandType());
     unsigned IndexBitWidth = OffsetIRTy->getIntegerBitWidth();
+
     // See importLoad's identical check for why this can be null on an
     // unusual custom datalayout (a >64-bit pointer-index type) --
     // convertType's width restriction applies to any integer type, and
@@ -570,6 +621,7 @@ private:
       llvm::Value *Idx = GTI.getOperand();
       if (llvm::StructType *StTy = GTI.getStructTypeOrNull()) {
         unsigned Field = cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
+
         // Same silent-corruption bug class as importAlloca's overflow fix:
         // a plain += could wrap Offset for a pathological but constructible
         // GEP chain (e.g. deeply nested/huge structs), producing a wrong,
@@ -578,8 +630,10 @@ private:
         uint64_t FieldOff = DL->getStructLayout(StTy)->getElementOffset(Field);
         if (AddOverflow(Offset, static_cast<int64_t>(FieldOff), Offset))
           return false;
+
         continue;
       }
+
       // getSequentialElementStride returns a TypeSize; a scalable stride
       // (e.g. this step indexes into a <vscale x N x T> element) would
       // fatally abort the compiler on the old implicit conversion to
@@ -588,6 +642,7 @@ private:
       TypeSize ElementSizeTS = GTI.getSequentialElementStride(*DL);
       if (ElementSizeTS.isScalable())
         return false;
+
       uint64_t ElementSize = ElementSizeTS.getFixedValue();
       if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
         if (auto Val = CI->getValue().trySExtValue()) {
@@ -606,6 +661,7 @@ private:
       // emit Idx * ElementSize (if needed) + a ptr_add for Idx itself.
       if (Idx->getType()->getIntegerBitWidth() != IndexBitWidth)
         return false;
+
       if (Offset != 0) {
         EmitConstOffset(Offset);
         Offset = 0;
@@ -664,6 +720,7 @@ private:
     llvm::Value *CalleeV = CI.getCalledOperand()->stripPointerCasts();
     if (!isa<Function, GlobalIFunc, GlobalAlias>(CalleeV))
       return false; // indirect call
+
     if (auto *F = dyn_cast<Function>(CalleeV))
       if (F->getIntrinsicID() != Intrinsic::not_intrinsic)
         return false;
@@ -703,9 +760,11 @@ private:
       if (!computeGMIRLeafTypes(Context, *DL, Arg->getType(), LeafTypes,
                                 Offsets))
         return false;
+
       SmallVector<mlir::Value, 1> ArgLeaves;
       if (!getOperands(Arg, ArgLeaves) || ArgLeaves.size() != LeafTypes.size())
         return false;
+
       LeafCounts.push_back(static_cast<int32_t>(ArgLeaves.size()));
       FlatArgs.append(ArgLeaves.begin(), ArgLeaves.end());
     }
@@ -719,6 +778,7 @@ private:
         FlatArgs, Builder.getDenseI32ArrayAttr(LeafCounts));
     if (RetTy)
       ValueMap[&CI] = {Op.getResult()};
+
     return true;
   }
 
@@ -728,9 +788,11 @@ private:
       func::ReturnOp::create(Builder, Builder.getUnknownLoc());
       return true;
     }
+
     mlir::Value MLIRRetVal;
     if (!getScalarOperand(RetVal, MLIRRetVal))
       return false;
+
     func::ReturnOp::create(Builder, Builder.getUnknownLoc(), MLIRRetVal);
     return true;
   }
@@ -739,6 +801,7 @@ private:
     SmallVector<mlir::Value> DestOperands;
     if (!getSuccessorOperands(*Br.getParent(), *Br.getSuccessor(0), DestOperands))
       return false;
+
     gmir::BrOp::create(Builder, Builder.getUnknownLoc(), DestOperands,
                         BlockMap[Br.getSuccessor(0)]);
     return true;
@@ -748,10 +811,12 @@ private:
     mlir::Value Cond;
     if (!getScalarOperand(Br.getCondition(), Cond))
       return false;
+
     SmallVector<mlir::Value> TrueOperands, FalseOperands;
     if (!getSuccessorOperands(*Br.getParent(), *Br.getSuccessor(0), TrueOperands) ||
         !getSuccessorOperands(*Br.getParent(), *Br.getSuccessor(1), FalseOperands))
       return false;
+
     gmir::CondBrOp::create(Builder, Builder.getUnknownLoc(), Cond, TrueOperands,
                             FalseOperands, BlockMap[Br.getSuccessor(0)],
                             BlockMap[Br.getSuccessor(1)]);
@@ -768,8 +833,10 @@ private:
       mlir::Value V;
       if (!getScalarOperand(PN.getIncomingValueForBlock(&FromBB), V))
         return false;
+
       Operands.push_back(V);
     }
+
     return true;
   }
 
@@ -797,16 +864,19 @@ private:
       Out.append(It->second.begin(), It->second.end());
       return true;
     }
+
     auto *CI = dyn_cast<ConstantInt>(V);
     if (!CI || CI->getValue().getSignificantBits() > 64) {
       ValueMap.erase(It);
       return false;
     }
+
     gmir::LLTType Ty = convertType(Context, CI->getType());
     if (!Ty) {
       ValueMap.erase(It);
       return false;
     }
+
     // Insert at the entry block's front-growing cursor, not wherever the
     // caller's Builder happens to be pointed -- see import()'s comment on
     // ConstantInsertPt for why: this constant may be memoized and reused
@@ -832,6 +902,7 @@ private:
     SmallVector<mlir::Value, 1> Leaves;
     if (!getOperands(V, Leaves) || Leaves.size() != 1)
       return false;
+
     Out = Leaves[0];
     return true;
   }
@@ -860,6 +931,7 @@ func::FuncOp gmir::importFunction(ModuleOp Module, Function &F) {
     gmir::LLTType Ty = convertType(Context, Arg.getType());
     if (!Ty)
       return {};
+
     ArgTypes.push_back(Ty);
   }
 
@@ -868,6 +940,7 @@ func::FuncOp gmir::importFunction(ModuleOp Module, Function &F) {
     gmir::LLTType Ty = convertType(Context, F.getReturnType());
     if (!Ty)
       return {};
+
     ResultTypes.push_back(Ty);
   }
 
@@ -882,5 +955,6 @@ func::FuncOp gmir::importFunction(ModuleOp Module, Function &F) {
     FuncOp.erase();
     return {};
   }
+
   return FuncOp;
 }

@@ -74,6 +74,7 @@ public:
     for (Block &BB : FuncOp.getFunctionBody()) {
       if (&BB == &EntryBB)
         continue;
+
       MIRBuilder.setMBB(*BlockMap[&BB]);
       SmallVector<MachineInstr *, 4> Skeletons;
       for (BlockArgument Arg : BB.getArguments()) {
@@ -83,6 +84,7 @@ public:
         auto MIB = MIRBuilder.buildInstr(TargetOpcode::G_PHI, {Reg}, {});
         Skeletons.push_back(MIB.getInstr());
       }
+
       SkeletonPhis[&BB] = std::move(Skeletons);
     }
 
@@ -113,6 +115,7 @@ public:
         }
       }
     }
+
     return true;
   }
 
@@ -132,6 +135,7 @@ private:
       ArgRegStorage.push_back({Reg});
       VRegArgs.push_back(ArgRegStorage.back());
     }
+
     MIRBuilder.setMBB(*BlockMap[&EntryBB]);
     return CLI.lowerFormalArguments(MIRBuilder, F, VRegArgs, FuncInfo);
   }
@@ -179,6 +183,7 @@ private:
     Block *FalseBB = Br.getFalseDest();
     MachineBasicBlock *TrueMBB = BlockMap[TrueBB];
     MachineBasicBlock *FalseMBB = BlockMap[FalseBB];
+
     // Always emit both terminators (G_BRCOND to true, unconditional G_BR
     // to false) rather than eliding a fallthrough -- correctness over
     // branch-layout optimality; downstream branch-folding/block-placement
@@ -214,6 +219,7 @@ private:
     if (auto ConstOp = dyn_cast<gmir::ConstantOp>(&Op)) {
       LLT Ty =
           convertLLT(cast<gmir::LLTType>(ConstOp.getResult().getType()), DL);
+
       // GMIRImporter always stores gmir.constant's value sign-extended to
       // 64 bits (I64Attr), regardless of the actual !gmir.llt width, so it
       // must be truncated back down here -- buildConstant asserts the
@@ -256,14 +262,17 @@ private:
                                            {LHS, RHS}))
 #undef GMIR_BINOP_CASE
 
-    // gmir.uaddo/uadde/usubo/usube -> G_U{ADD,SUB}{O,E}, and gmir.unmerge/
-    // merge -> G_UNMERGE_VALUES/G_MERGE_VALUES: emitted only by
-    // GMIRLegalizer's NarrowScalarAddSubPattern (see GMIRLegalizer.cpp),
-    // never by GMIRImporter directly. Must be handled here regardless: once
-    // the legalizer rewrites a gmir.add/sub into this sequence, this
-    // translator is the only thing standing between it and a "leave it for
-    // the legacy selector" fallback, which would silently defeat the whole
-    // point of the legalizer slice.
+    // gmir.uaddo/uadde/usubo/usube -> G_U{ADD,SUB}{O,E}: emitted only by
+    // GMIRLegalizer's AddSubLegalizePattern (see GMIRLegalizer.cpp), never
+    // by GMIRImporter directly. gmir.unmerge/merge -> G_UNMERGE_VALUES/
+    // G_MERGE_VALUES are also legalizer-only, but shared across all three
+    // merged dispatcher patterns (AddSubLegalizePattern,
+    // BitwiseLegalizePattern, MulLegalizePattern), not just this one. Must
+    // be handled here regardless: once the legalizer rewrites a gmir op
+    // into one of these sequences, this translator is the only thing
+    // standing between it and a "leave it for the legacy selector"
+    // fallback, which would silently defeat the whole point of the
+    // legalizer slice.
 #define GMIR_ADDSUBCARRYO_CASE(OpTy, Build)                                    \
   if (auto CarryOp = dyn_cast<gmir::OpTy>(&Op)) {                              \
     Register LHS = ValueToReg.lookup(CarryOp.getLhs());                        \
@@ -338,11 +347,12 @@ private:
 
     // gmir.build_vector -> G_BUILD_VECTOR, and gmir.anyext/trunc ->
     // G_ANYEXT/G_TRUNC: like gmir.uaddo/unmerge above, emitted only by
-    // GMIRLegalizer (FewerElementsScalarizePattern and WidenScalarPattern
-    // respectively), never by GMIRImporter directly -- must be handled
-    // here for the same reason: skipping them would silently defeat
-    // those patterns by falling back to the legacy selector instead of
-    // translating their output.
+    // GMIRLegalizer (the shared rewriteFewerElements/rewriteWidenScalar
+    // helpers, called from all three merged dispatcher patterns -- see
+    // GMIRLegalizer.cpp), never by GMIRImporter directly -- must be
+    // handled here for the same reason: skipping them would silently
+    // defeat those patterns by falling back to the legacy selector
+    // instead of translating their output.
     if (auto BuildVector = dyn_cast<gmir::BuildVectorOp>(&Op)) {
       SmallVector<Register, 4> SrcRegs;
       for (mlir::Value Src : BuildVector.getSrcs())
@@ -462,6 +472,7 @@ private:
   bool translateCall(gmir::CallOp Call) {
     auto *CI = mlir::OpaqueLoc::getUnderlyingLocationOrNull<llvm::CallInst *>(
         Call.getLoc());
+
     // Every gmir.call GMIRImporter ever produces carries this by
     // construction (see importCall), so this "should" always be
     // non-null -- but unlike everywhere else in this file that assumes
@@ -514,6 +525,7 @@ private:
 
     if (Call.getNumResults() == 1)
       ValueToReg[Call.getResult()] = ResRegs[0];
+
     return true;
   }
 
@@ -536,6 +548,7 @@ private:
     MachineMemOperand::Flags Flags = BaseFlags;
     if (IsVolatile)
       Flags |= MachineMemOperand::MOVolatile;
+
     return MF.getMachineMemOperand(
         MachinePointerInfo(), Flags, Ty, Align(AlignBytes), MMOMetadata(),
         static_cast<SyncScope::ID>(SyncScopeVal),
@@ -562,6 +575,7 @@ bool gmir::translate(func::FuncOp FuncOp, Function &F, MachineFunction &MF,
   FunctionLoweringInfo FuncInfo;
   FuncInfo.clear();
   FuncInfo.MF = &MF;
+
   // FunctionLoweringInfo::BPI is non-const (used internally by some
   // CallLowering implementations for sret-demotion heuristics, per its
   // doc comment); not applicable to the scalar-only subset this bridges,

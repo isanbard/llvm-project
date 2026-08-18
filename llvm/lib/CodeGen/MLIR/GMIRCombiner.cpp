@@ -69,6 +69,7 @@ gmir::CombinerPatternCache::get(MLIRContext &Context) {
     Patterns.add<MulNegOneToSubPattern>(&Context);
     Cache.emplace(std::move(Patterns));
   }
+
   return *Cache;
 }
 

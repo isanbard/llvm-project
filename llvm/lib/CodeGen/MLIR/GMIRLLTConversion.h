@@ -54,9 +54,11 @@ inline LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
   if (Ty.getNumElements() != 0)
     return LLT::vector(ElementCount::getFixed(Ty.getNumElements()),
                        LLT::integer(Ty.getScalarSizeInBits()));
+
   if (Ty.getScalarSizeInBits() == 0)
     return LLT::pointer(Ty.getAddressSpace(),
                         DL.getPointerSizeInBits(Ty.getAddressSpace()));
+
   return LLT::integer(Ty.getScalarSizeInBits());
 }
 
@@ -72,10 +74,12 @@ inline gmir::LLTType convertToGMIRType(mlir::MLIRContext &Context, LLT Ty) {
     return gmir::LLTType::get(&Context, Ty.getScalarSizeInBits(),
                               Ty.getNumElements(), /*addressSpace=*/0,
                               /*isScalable=*/false);
+
   if (Ty.isPointer())
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, Ty.getAddressSpace(),
                               /*isScalable=*/false);
+
   return gmir::LLTType::get(&Context, Ty.getScalarSizeInBits(),
                             /*numElements=*/0, /*addressSpace=*/0,
                             /*isScalable=*/false);

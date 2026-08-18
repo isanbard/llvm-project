@@ -81,15 +81,15 @@ class MLIRInstructionSelect : public MachineFunctionPass {
 public:
   static char ID;
 
-  // MLIRContext/dialect loading and the legalizer's pattern cache are
-  // pass-instance state, constructed once and reused across every
-  // runOnMachineFunction call (i.e. once per module, not once per
-  // function) -- a MachineFunctionPass instance is never shared across
-  // compilation threads in any parallel-codegen configuration, so no
-  // locking is needed for either. See GMIRLegalizer.h's
-  // LegalizerPatternCache doc for why this is also a correctness
-  // prerequisite for that cache (the cached patterns capture this
-  // Context by pointer).
+  // MLIRContext/dialect loading and the legalizer's and combiner's
+  // pattern caches are pass-instance state, constructed once and reused
+  // across every runOnMachineFunction call (i.e. once per module, not
+  // once per function) -- a MachineFunctionPass instance is never shared
+  // across compilation threads in any parallel-codegen configuration, so
+  // no locking is needed for any of them. See GMIRLegalizer.h's
+  // LegalizerPatternCache doc (GMIRCombiner.h's CombinerPatternCache is
+  // the same shape) for why this is also a correctness prerequisite for
+  // those caches (the cached patterns capture this Context by pointer).
   MLIRInstructionSelect() : MachineFunctionPass(ID) {
     Context.getOrLoadDialect<gmir::GMIRDialect>();
     Context.getOrLoadDialect<mlir::func::FuncDialect>();
@@ -152,12 +152,12 @@ public:
     }
 
     // Everything below is only needed once import/legalization/combining
-    // succeeded
-    // -- fetched here, after that check, rather than unconditionally up
-    // front, so a function outside the supported subset (the common case
-    // for real-world code today) doesn't pay for an unused BPI lookup, a
-    // TargetPassConfig analysis fetch, a CSE-config query, and
-    // createMIRBuilder's allocation before falling back.
+    // succeeded -- fetched here, after that check, rather than
+    // unconditionally up front, so a function outside the supported
+    // subset (the common case for real-world code today) doesn't pay for
+    // an unused BPI lookup, a TargetPassConfig analysis fetch, a
+    // CSE-config query, and createMIRBuilder's allocation before falling
+    // back.
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
 
     // Match IRTranslator::translate's own choice of builder exactly (see
@@ -175,6 +175,7 @@ public:
     if (TPC.isGISelCSEEnabled())
       CSEInfo = &getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
           TPC.getCSEConfig());
+
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
     if (!gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
@@ -183,6 +184,7 @@ public:
       MF.getProperties().setFailedISel();
       return false;
     }
+
     return false;
   }
 

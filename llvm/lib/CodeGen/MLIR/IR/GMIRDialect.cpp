@@ -52,6 +52,7 @@ std::optional<APInt> getGMIRConstOperand(mlir::Attribute Attr, unsigned Width) {
   auto IntAttr = dyn_cast_or_null<IntegerAttr>(Attr);
   if (!IntAttr)
     return std::nullopt;
+
   return IntAttr.getValue().trunc(Width);
 }
 
@@ -76,13 +77,17 @@ OpFoldResult AddOp::fold(FoldAdaptor adaptor) {
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+
   // x + 0 -> x (either side, gmir.add is Commutative).
   if (Rhs && Rhs->isZero())
     return getLhs();
+
   if (Lhs && Lhs->isZero())
     return getRhs();
+
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs + *Rhs);
+
   return {};
 }
 
@@ -93,12 +98,14 @@ OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
   // GMIRDialect::materializeConstant below.
   if (getLhs() == getRhs())
     return makeGMIRConstAttr(getContext(), APInt::getZero(64));
+
   unsigned Width =
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs - *Rhs);
+
   return {};
 }
 
@@ -107,18 +114,24 @@ OpFoldResult MulOp::fold(FoldAdaptor adaptor) {
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+
   // x * 0 -> 0 (the zero operand already IS the correct result value).
   if (Rhs && Rhs->isZero())
     return getRhs();
+
   if (Lhs && Lhs->isZero())
     return getLhs();
+
   // x * 1 -> x.
   if (Rhs && Rhs->isOne())
     return getLhs();
+
   if (Lhs && Lhs->isOne())
     return getRhs();
+
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs * *Rhs);
+
   return {};
 }
 
@@ -126,24 +139,31 @@ OpFoldResult AndOp::fold(FoldAdaptor adaptor) {
   // x & x -> x (SSA value equality).
   if (getLhs() == getRhs())
     return getLhs();
+
   unsigned Width =
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+
   // x & 0 -> 0 (the zero operand already IS the correct result). Not a
   // literal DAGCombiner one-liner for scalars (only spelled out as a
   // vector-splat form there), but a trivially-true, zero-risk identity.
   if (Rhs && Rhs->isZero())
     return getRhs();
+
   if (Lhs && Lhs->isZero())
     return getLhs();
+
   // x & -1 -> x.
   if (Rhs && Rhs->isAllOnes())
     return getLhs();
+
   if (Lhs && Lhs->isAllOnes())
     return getRhs();
+
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs & *Rhs);
+
   return {};
 }
 
@@ -151,24 +171,31 @@ OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
   // x | x -> x (SSA value equality).
   if (getLhs() == getRhs())
     return getLhs();
+
   unsigned Width =
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+
   // x | 0 -> x. Not a literal DAGCombiner scalar one-liner (only the
   // vector-splat form exists there), same rationale as AndOp's x&0->0.
   if (Rhs && Rhs->isZero())
     return getLhs();
+
   if (Lhs && Lhs->isZero())
     return getRhs();
+
   // x | -1 -> -1 (the all-ones operand already IS the correct result).
   // Same "not a literal scalar DAGCombiner line" caveat as x&0->0/x|0->x.
   if (Rhs && Rhs->isAllOnes())
     return getRhs();
+
   if (Lhs && Lhs->isAllOnes())
     return getLhs();
+
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs | *Rhs);
+
   return {};
 }
 
@@ -177,13 +204,17 @@ OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
   auto Rhs = getGMIRConstOperand(adaptor.getRhs(), Width);
+
   // x ^ 0 -> x.
   if (Rhs && Rhs->isZero())
     return getLhs();
+
   if (Lhs && Lhs->isZero())
     return getRhs();
+
   if (Lhs && Rhs)
     return makeGMIRConstAttr(getContext(), *Lhs ^ *Rhs);
+
   return {};
 }
 
@@ -298,15 +329,19 @@ void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
 LogicalResult UnmergeOp::verify() {
   if (getDsts().empty())
     return emitOpError("expected at least one result");
+
   auto Ty = cast<gmir::LLTType>(getDsts().front().getType());
   for (mlir::Value Dst : getDsts().drop_front())
     if (Dst.getType() != Ty)
       return emitOpError("all results must have the same type");
+
   auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
   if (Ty.getScalarSizeInBits() == 0 || SrcTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+
   if (Ty.getNumElements() != 0)
     return emitOpError("results must be scalar");
+
   // Two distinct shapes, both real G_UNMERGE_VALUES uses (see the op's
   // doc comment): a vector source splits into its per-element scalar
   // lanes (count-based -- each dst is one element, not a bit-width
@@ -315,29 +350,37 @@ LogicalResult UnmergeOp::verify() {
   if (SrcTy.getNumElements() != 0) {
     if (SrcTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
       return emitOpError("results must match the operand's element width");
+
     if (SrcTy.getNumElements() != getDsts().size())
       return emitOpError("result count must match the operand's element count");
+
     return success();
   }
+
   if (SrcTy.getScalarSizeInBits() !=
       Ty.getScalarSizeInBits() * getDsts().size())
     return emitOpError("result bit widths must sum to the operand's width");
+
   return success();
 }
 
 LogicalResult MergeOp::verify() {
   if (getSrcs().empty())
     return emitOpError("expected at least one operand");
+
   auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
   for (mlir::Value Src : getSrcs().drop_front())
     if (Src.getType() != Ty)
       return emitOpError("all operands must have the same type");
+
   auto DstTy = cast<gmir::LLTType>(getDst().getType());
   if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+
   if (DstTy.getScalarSizeInBits() !=
       Ty.getScalarSizeInBits() * getSrcs().size())
     return emitOpError("operand bit widths must sum to the result's width");
+
   return success();
 }
 
@@ -349,19 +392,25 @@ LogicalResult MergeOp::verify() {
 LogicalResult BuildVectorOp::verify() {
   if (getSrcs().empty())
     return emitOpError("expected at least one operand");
+
   auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
   for (mlir::Value Src : getSrcs().drop_front())
     if (Src.getType() != Ty)
       return emitOpError("all operands must have the same type");
+
   auto DstTy = cast<gmir::LLTType>(getDst().getType());
   if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+
   if (Ty.getNumElements() != 0)
     return emitOpError("operands must be scalar");
+
   if (DstTy.getNumElements() != getSrcs().size())
     return emitOpError("result element count must match the operand count");
+
   if (DstTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
     return emitOpError("result element width must match the operands' width");
+
   return success();
 }
 
@@ -375,6 +424,7 @@ LogicalResult AnyExtOp::verify() {
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+
   // Width-only checks below don't by themselves rule out a vector operand
   // paired with a scalar result (or a mismatched element count/scalability)
   // -- both slip through undetected without an explicit shape check, since
@@ -382,8 +432,10 @@ LogicalResult AnyExtOp::verify() {
   if (SrcTy.getNumElements() != ResTy.getNumElements() ||
       SrcTy.getIsScalable() != ResTy.getIsScalable())
     return emitOpError("vector shape must match between operand and result");
+
   if (ResTy.getScalarSizeInBits() <= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be wider than the operand");
+
   return success();
 }
 
@@ -392,13 +444,16 @@ LogicalResult TruncOp::verify() {
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+
   // See AnyExtOp::verify() above for why this check is needed separately
   // from the width checks.
   if (SrcTy.getNumElements() != ResTy.getNumElements() ||
       SrcTy.getIsScalable() != ResTy.getIsScalable())
     return emitOpError("vector shape must match between operand and result");
+
   if (ResTy.getScalarSizeInBits() >= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be narrower than the operand");
+
   return success();
 }
 

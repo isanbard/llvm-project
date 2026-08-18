@@ -93,14 +93,17 @@ std::optional<std::pair<LLT, unsigned>>
 getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy) {
   if (Step.Action != LegalizeActions::NarrowScalar)
     return std::nullopt;
+
   LLT NarrowTy = Step.NewType;
   unsigned DstBits = DstTy.getSizeInBits();
   unsigned NarrowBits = NarrowTy.getSizeInBits();
   if (NarrowBits == 0 || DstBits % NarrowBits != 0)
     return std::nullopt;
+
   unsigned NumParts = DstBits / NarrowBits;
   if (NumParts < 2)
     return std::nullopt;
+
   return std::make_pair(NarrowTy, NumParts);
 }
 
@@ -205,6 +208,7 @@ bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
                              RhsParts.getDsts()[I]);
     DstParts.push_back(Lane.getResult());
   }
+
   Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
   return true;
 }
@@ -272,6 +276,7 @@ public:
           CarryIn = C.getCarryOut();
         }
       }
+
       Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
       return success();
     }
@@ -326,6 +331,7 @@ public:
                                   LhsParts.getDsts()[I], RhsParts.getDsts()[I]);
         DstParts.push_back(Chunk.getResult());
       }
+
       Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
       return success();
     }
@@ -390,6 +396,7 @@ public:
 
     if (auto Split = getExactNarrowScalarSplit(Step, DstTy)) {
       auto [NarrowTy, NumParts] = *Split;
+
       // Only the 2-limb case is implemented (see the class doc comment
       // for why NumParts other than 2 is a real, if so-far-unobserved,
       // possibility rather than something the importer's type cap rules
