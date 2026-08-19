@@ -41,6 +41,58 @@ static IntegerAttr makeGMIRConstAttr(MLIRContext *Context, APInt Value) {
   return IntegerAttr::get(mlir::IntegerType::get(Context, 64), Value.sext(64));
 }
 
+// Given Op (of type OpTy), returns (X, C) if exactly one operand is a
+// constant C and the other is a non-constant X, both already truncated
+// to Width -- checking both operand orders, since gmir has no
+// automatic canonicalization (unlike DAGCombiner's own N1IsConst
+// canonicalization). Shared by every M5 slice-2+ pattern needing this
+// "peel a constant off a binop, either side" shape
+// (MulNegOneToSubPattern, DisjointAddToOrPattern,
+// ReassociateConstOpPattern below) -- static, not anonymous-namespace-
+// wrapped, per Bill's Clang/LLVM style preference for free functions.
+template <typename OpTy>
+static std::optional<std::pair<mlir::Value, APInt>>
+matchConstOperand(OpTy Op, unsigned Width) {
+  IntegerAttr C;
+  if (matchPattern(Op.getRhs(), m_Constant(&C)))
+    return std::make_pair(Op.getLhs(), C.getValue().trunc(Width));
+
+  if (matchPattern(Op.getLhs(), m_Constant(&C)))
+    return std::make_pair(Op.getRhs(), C.getValue().trunc(Width));
+
+  return std::nullopt;
+}
+
+// Shared search skeleton for RepeatedOperandIdempotentPattern/
+// XorSelfCancelPattern below: for each of Op's two operands, checks
+// whether it's defined by OpTy and whether Op's *other* operand
+// structurally equals one of that inner op's own two operands. On the
+// first match, calls OnMatch(Inner, MatchedLhs) -- true if Other
+// equaled Inner.getLhs(), false if it equaled Inner.getRhs() -- and
+// returns its result; std::nullopt if no candidate matches. The two
+// patterns need different replacement values on a match (AND/OR want
+// Inner's whole result, XOR wants one of Inner's own sub-operands), so
+// that choice is left to the caller's callback rather than baked in
+// here.
+template <typename OpTy, typename CallbackTy>
+static std::optional<mlir::Value> matchRepeatedOperand(OpTy Op,
+                                                       CallbackTy OnMatch) {
+  for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+    auto Inner = Cand.getDefiningOp<OpTy>();
+    if (!Inner)
+      continue;
+
+    mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+    if (Other == Inner.getLhs())
+      return OnMatch(Inner, /*MatchedLhs=*/true);
+
+    if (Other == Inner.getRhs())
+      return OnMatch(Inner, /*MatchedLhs=*/false);
+  }
+
+  return std::nullopt;
+}
+
 namespace {
 /// `mul x, -1 -> sub(0, x)` (DAGCombiner.cpp's visitMUL, unconditional --
 /// no TLI/legality/hasOneUse() gating). The first M5 slice needing a
@@ -57,23 +109,13 @@ public:
 
   LogicalResult matchAndRewrite(gmir::MulOp Op,
                                 PatternRewriter &Rewriter) const override {
-    mlir::Value Other;
-    IntegerAttr ConstAttr;
-    if (matchPattern(Op.getRhs(), m_Constant(&ConstAttr)))
-      Other = Op.getLhs();
-    else if (matchPattern(Op.getLhs(), m_Constant(&ConstAttr)))
-      Other = Op.getRhs();
-    else
-      return failure();
-
-    // Truncate to the op's real width before checking all-ones --
-    // gmir.constant's I64Attr is always 64-bit sign-extended regardless
-    // of the op's real, possibly narrower, width (same width-
-    // correctness discipline as M5 slice 1's fold() bodies).
     auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
     unsigned Width = DstGTy.getScalarSizeInBits();
-    if (!ConstAttr.getValue().trunc(Width).isAllOnes())
+
+    auto Match = matchConstOperand(Op, Width);
+    if (!Match || !Match->second.isAllOnes())
       return failure();
+    mlir::Value Other = Match->first;
 
     Location Loc = Op.getLoc();
     auto ZeroAttr = IntegerAttr::get(
@@ -150,11 +192,8 @@ public:
     // gmir.and is Commutative, but that trait alone doesn't canonicalize
     // operand order, same reasoning as MulNegOneToSubPattern above.
     auto getMask = [&](gmir::AndOp And) -> std::optional<APInt> {
-      IntegerAttr C;
-      if (matchPattern(And.getRhs(), m_Constant(&C)) ||
-          matchPattern(And.getLhs(), m_Constant(&C)))
-        return C.getValue().trunc(Width);
-      return std::nullopt;
+      auto Match = matchConstOperand(And, Width);
+      return Match ? std::optional(Match->second) : std::nullopt;
     };
     std::optional<APInt> C1 = getMask(LHSAnd);
     std::optional<APInt> C2 = getMask(RHSAnd);
@@ -203,38 +242,22 @@ public:
     auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
     unsigned Width = DstGTy.getScalarSizeInBits();
 
-    // Decompose V as OpTy(x, c) for some non-constant x and constant c,
-    // checking both operand orders -- gmir has no automatic
-    // canonicalization, same reasoning as every prior slice's
-    // dual-order checks.
-    auto AsOpWithConst =
-        [&](mlir::Value V) -> std::optional<std::pair<mlir::Value, APInt>> {
-      auto Inner = V.getDefiningOp<OpTy>();
-      if (!Inner)
-        return std::nullopt;
-      IntegerAttr C;
-      if (matchPattern(Inner.getRhs(), m_Constant(&C)))
-        return std::make_pair(Inner.getLhs(), C.getValue().trunc(Width));
-      if (matchPattern(Inner.getLhs(), m_Constant(&C)))
-        return std::make_pair(Inner.getRhs(), C.getValue().trunc(Width));
-      return std::nullopt;
-    };
+    auto Outer = matchConstOperand(Op, Width);
+    if (!Outer)
+      return failure();
+    auto [OuterOther, C2] = *Outer;
 
-    IntegerAttr OuterConst;
-    mlir::Value OuterOther;
-    if (matchPattern(Op.getRhs(), m_Constant(&OuterConst)))
-      OuterOther = Op.getLhs();
-    else if (matchPattern(Op.getLhs(), m_Constant(&OuterConst)))
-      OuterOther = Op.getRhs();
-    else
+    // OuterOther must itself be OpTy(x, c1) for some non-constant x and
+    // constant c1 -- gmir has no automatic canonicalization, same
+    // reasoning as every prior slice's dual-order checks.
+    auto InnerOp = OuterOther.template getDefiningOp<OpTy>();
+    if (!InnerOp)
       return failure();
 
-    std::optional<std::pair<mlir::Value, APInt>> Inner =
-        AsOpWithConst(OuterOther);
+    auto Inner = matchConstOperand(InnerOp, Width);
     if (!Inner)
       return failure();
     auto [X, C1] = *Inner;
-    APInt C2 = OuterConst.getValue().trunc(Width);
 
     IntegerAttr NewConst =
         makeGMIRConstAttr(Rewriter.getContext(), Combine(C1, C2));
@@ -257,17 +280,13 @@ public:
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
-    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
-      auto Inner = Cand.getDefiningOp<OpTy>();
-      if (!Inner)
-        continue;
-      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
-      if (Other == Inner.getLhs() || Other == Inner.getRhs()) {
-        Rewriter.replaceOp(Op, Inner.getResult());
-        return success();
-      }
-    }
-    return failure();
+    auto Result = matchRepeatedOperand(
+        Op, [](OpTy Inner, bool) { return Inner.getResult(); });
+    if (!Result)
+      return failure();
+
+    Rewriter.replaceOp(Op, *Result);
+    return success();
   }
 };
 
@@ -283,21 +302,15 @@ public:
 
   LogicalResult matchAndRewrite(gmir::XorOp Op,
                                 PatternRewriter &Rewriter) const override {
-    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
-      auto Inner = Cand.getDefiningOp<gmir::XorOp>();
-      if (!Inner)
-        continue;
-      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
-      if (Other == Inner.getLhs()) {
-        Rewriter.replaceOp(Op, Inner.getRhs());
-        return success();
-      }
-      if (Other == Inner.getRhs()) {
-        Rewriter.replaceOp(Op, Inner.getLhs());
-        return success();
-      }
-    }
-    return failure();
+    auto Result =
+        matchRepeatedOperand(Op, [](gmir::XorOp Inner, bool MatchedLhs) {
+          return MatchedLhs ? Inner.getRhs() : Inner.getLhs();
+        });
+    if (!Result)
+      return failure();
+
+    Rewriter.replaceOp(Op, *Result);
+    return success();
   }
 };
 } // namespace

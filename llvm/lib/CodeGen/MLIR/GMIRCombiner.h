@@ -27,8 +27,12 @@
 // GMIRTargetLoweringAdapter in GMIRCombiner.cpp, the same shape
 // GMIRLegalizerInfoAdapter wraps LegalizerInfo in GMIRLegalizer.cpp) --
 // e.g. slice 3's DisjointAddToOrPattern: `add(and(a,C1), and(b,C2)) ->
-// or(...)` when the masks are disjoint and TLI reports OR legal. See
-// ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
+// or(...)` when the masks are disjoint and TLI reports OR legal. M5
+// slice 4 adds more patterns in category (c) -- constant reassociation
+// and repeated-operand identities (`(x+c1)+c2 -> x+(c1+c2)`, `(a&b)&a
+// -> a&b`, `(a^b)^a -> b`) -- ported from a single DAGCombiner.cpp
+// helper (reassociateOpsCommutative) shared by visitADD/MUL/AND/OR/XOR.
+// See ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
 // design, including why -print-gmir-after-combine (not just the usual
 // -global-isel asm-diff) is the real proof this pass's own code ran on
 // AArch64 specifically (a real downstream GICombiner pass runs there
