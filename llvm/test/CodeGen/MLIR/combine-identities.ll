@@ -224,3 +224,116 @@ define i32 @mul_neg_one_lhs(i32 %x) {
 ; ASM-LABEL: mul_neg_one_lhs:
 ; ASM-NOT: imull
 ; ASM: negl %eax
+
+; M5 slice 4's constant-reassociation/repeated-operand identities
+; (ReassociateConstOpPattern/RepeatedOperandIdempotentPattern/
+; XorSelfCancelPattern, GMIRCombiner.cpp), ported from DAGCombiner.cpp's
+; reassociateOpsCommutative -- shared identically by visitADD/MUL/AND/
+; OR/XOR. (x+3)+4 -> x+7, etc.: both original adds/muls/etc. collapse
+; into a single op against the combined constant.
+
+define i32 @add_reassoc_const(i32 %x) {
+  %a = add i32 %x, 3
+  %r = add i32 %a, 4
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @add_reassoc_const
+; GMIR: gmir.constant 7
+; GMIR: gmir.add
+; GMIR-NOT: gmir.add
+; GMIR: return
+; ASM-LABEL: add_reassoc_const:
+; ASM: leal 7(%rdi), %eax
+
+define i32 @mul_reassoc_const(i32 %x) {
+  %a = mul i32 %x, 3
+  %r = mul i32 %a, 4
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @mul_reassoc_const
+; GMIR: gmir.constant 12
+; GMIR: gmir.mul
+; GMIR-NOT: gmir.mul
+; GMIR: return
+; ASM-LABEL: mul_reassoc_const:
+; ASM: imull $12, %edi, %eax
+
+define i32 @and_reassoc_const(i32 %x) {
+  %a = and i32 %x, 240
+  %r = and i32 %a, 255
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @and_reassoc_const
+; GMIR: gmir.constant 240
+; GMIR: gmir.and
+; GMIR-NOT: gmir.and
+; GMIR: return
+; ASM-LABEL: and_reassoc_const:
+; ASM: andl $240, %eax
+
+define i32 @or_reassoc_const(i32 %x) {
+  %a = or i32 %x, 1
+  %r = or i32 %a, 2
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @or_reassoc_const
+; GMIR: gmir.constant 3
+; GMIR: gmir.or
+; GMIR-NOT: gmir.or
+; GMIR: return
+; ASM-LABEL: or_reassoc_const:
+; ASM: orl $3, %eax
+
+define i32 @xor_reassoc_const(i32 %x) {
+  %a = xor i32 %x, 1
+  %r = xor i32 %a, 3
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_reassoc_const
+; GMIR: gmir.constant 2
+; GMIR: gmir.xor
+; GMIR-NOT: gmir.xor
+; GMIR: return
+; ASM-LABEL: xor_reassoc_const:
+; ASM: xorl $2, %eax
+
+; Repeated-operand identities: (a&b)&a -> a&b, (a|b)|b -> a|b,
+; (a^b)^a -> b. Each original outer op vanishes entirely -- AND/OR
+; collapse to the single inner op; XOR collapses all the way to a bare
+; return of the surviving operand.
+
+define i32 @and_repeated_operand(i32 %a, i32 %b) {
+  %m = and i32 %a, %b
+  %r = and i32 %m, %a
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @and_repeated_operand
+; GMIR: gmir.and %arg0, %arg1
+; GMIR-NOT: gmir.and
+; GMIR: return
+; ASM-LABEL: and_repeated_operand:
+; ASM: andl %edi, %eax
+
+define i32 @or_repeated_operand(i32 %a, i32 %b) {
+  %m = or i32 %a, %b
+  %r = or i32 %m, %b
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @or_repeated_operand
+; GMIR: gmir.or %arg0, %arg1
+; GMIR-NOT: gmir.or
+; GMIR: return
+; ASM-LABEL: or_repeated_operand:
+; ASM: orl %edi, %eax
+
+define i32 @xor_self_cancel(i32 %a, i32 %b) {
+  %m = xor i32 %a, %b
+  %r = xor i32 %m, %a
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_self_cancel
+; GMIR-NOT: gmir.xor
+; GMIR: return %arg1
+; ASM-LABEL: xor_self_cancel:
+; ASM-NOT: xorl
+; ASM: movl %esi, %eax

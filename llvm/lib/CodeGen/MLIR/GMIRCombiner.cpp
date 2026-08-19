@@ -25,6 +25,22 @@
 using namespace llvm;
 using namespace mlir;
 
+// Packages Value (already computed at the op's real width) as the
+// 64-bit-sign-extended I64Attr gmir.constant expects -- mirrors
+// GMIRDialect.cpp's TU-local helper of the same name exactly (see its
+// doc comment there for the full width-correctness rationale). Not
+// promoted to a shared header: same "not worth it for one file's use"
+// call M5 slice 2 already made for this exact helper, now needed a
+// second time within this file (ReassociateConstOpPattern below)
+// rather than duplicated inline per call site the way slice 2/3 wrote
+// the sign-extend dance each time. Declared static, not wrapped in an
+// anonymous namespace, per Bill's Clang/LLVM style preference: `static`
+// is the right tool for a free function; anonymous namespaces are for
+// classes, which can't be `static` directly (see every class below).
+static IntegerAttr makeGMIRConstAttr(MLIRContext *Context, APInt Value) {
+  return IntegerAttr::get(mlir::IntegerType::get(Context, 64), Value.sext(64));
+}
+
 namespace {
 /// `mul x, -1 -> sub(0, x)` (DAGCombiner.cpp's visitMUL, unconditional --
 /// no TLI/legality/hasOneUse() gating). The first M5 slice needing a
@@ -153,6 +169,137 @@ public:
     return success();
   }
 };
+
+/// Function-pointer type for ReassociateConstOpPattern's constant
+/// combinator (add/mul/and/or/xor's own APInt operator, injected via the
+/// constructor rather than a per-op template function specialization --
+/// see GMIRCombiner.h and design doc §1.24 for why: the latter shape is
+/// exactly what caused friction on GMIRLegalizer.cpp's
+/// getGenericOpcode<OpTy>() when Bill tried converting it to `static`
+/// (explicit specializations can't independently take a storage-class-
+/// specifier), so this pattern deliberately avoids reintroducing it).
+using ConstCombinator = APInt (*)(const APInt &, const APInt &);
+
+/// `(op (op x, c1), c2) -> (op x, (op c1, c2))` (DAGCombiner.cpp's
+/// reassociateOpsCommutative, lines 1252-1259 -- the purely structural,
+/// unconditional half of a helper shared identically by visitADD/MUL/
+/// AND/OR/XOR; the third sub-fold there is TLI-gated via
+/// isReassocProfitable(SelectionDAG&, ...)/isReassocProfitable(
+/// MachineRegisterInfo&, ...), neither of which exists yet at
+/// gmir-combine time -- see design doc §1.24, not ported). fold() always
+/// runs before patterns (M5 slice 2's established precedent), so Op
+/// never has both operands constant here -- no coordination conflict
+/// with the arithmetic-op fold()s slice 1 already registered.
+template <typename OpTy>
+class ReassociateConstOpPattern : public OpRewritePattern<OpTy> {
+  ConstCombinator Combine;
+
+public:
+  ReassociateConstOpPattern(MLIRContext *Context, ConstCombinator Combine)
+      : OpRewritePattern<OpTy>(Context), Combine(Combine) {}
+
+  LogicalResult matchAndRewrite(OpTy Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    unsigned Width = DstGTy.getScalarSizeInBits();
+
+    // Decompose V as OpTy(x, c) for some non-constant x and constant c,
+    // checking both operand orders -- gmir has no automatic
+    // canonicalization, same reasoning as every prior slice's
+    // dual-order checks.
+    auto AsOpWithConst =
+        [&](mlir::Value V) -> std::optional<std::pair<mlir::Value, APInt>> {
+      auto Inner = V.getDefiningOp<OpTy>();
+      if (!Inner)
+        return std::nullopt;
+      IntegerAttr C;
+      if (matchPattern(Inner.getRhs(), m_Constant(&C)))
+        return std::make_pair(Inner.getLhs(), C.getValue().trunc(Width));
+      if (matchPattern(Inner.getLhs(), m_Constant(&C)))
+        return std::make_pair(Inner.getRhs(), C.getValue().trunc(Width));
+      return std::nullopt;
+    };
+
+    IntegerAttr OuterConst;
+    mlir::Value OuterOther;
+    if (matchPattern(Op.getRhs(), m_Constant(&OuterConst)))
+      OuterOther = Op.getLhs();
+    else if (matchPattern(Op.getLhs(), m_Constant(&OuterConst)))
+      OuterOther = Op.getRhs();
+    else
+      return failure();
+
+    std::optional<std::pair<mlir::Value, APInt>> Inner =
+        AsOpWithConst(OuterOther);
+    if (!Inner)
+      return failure();
+    auto [X, C1] = *Inner;
+    APInt C2 = OuterConst.getValue().trunc(Width);
+
+    IntegerAttr NewConst =
+        makeGMIRConstAttr(Rewriter.getContext(), Combine(C1, C2));
+    auto NewC =
+        gmir::ConstantOp::create(Rewriter, Op.getLoc(), DstGTy, NewConst);
+    Rewriter.replaceOpWithNewOp<OpTy>(Op, DstGTy, X, NewC.getResult());
+    return success();
+  }
+};
+
+/// AND/OR idempotence (DAGCombiner.cpp's reassociateOpsCommutative,
+/// lines 1270-1277): `(a op b) op a -> a op b`, `(a op b) op b -> a op
+/// b`. Both ops share identical behavior (replace with the inner op's
+/// whole result) -- unlike XOR below, which returns a *sub*-operand of
+/// the inner op instead, so it can't share this template.
+template <typename OpTy>
+class RepeatedOperandIdempotentPattern : public OpRewritePattern<OpTy> {
+public:
+  using OpRewritePattern<OpTy>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(OpTy Op,
+                                PatternRewriter &Rewriter) const override {
+    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+      auto Inner = Cand.getDefiningOp<OpTy>();
+      if (!Inner)
+        continue;
+      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+      if (Other == Inner.getLhs() || Other == Inner.getRhs()) {
+        Rewriter.replaceOp(Op, Inner.getResult());
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+/// XOR self-cancellation (DAGCombiner.cpp's reassociateOpsCommutative,
+/// lines 1278-1285): `(a ^ b) ^ a -> b`, `(a ^ b) ^ b -> a`. Kept
+/// standalone rather than templated: unlike AND/OR's idempotence above,
+/// the result here is one of the *inner* op's own sub-operands, not the
+/// inner op's whole result, so it doesn't fit
+/// RepeatedOperandIdempotentPattern's shape.
+class XorSelfCancelPattern : public OpRewritePattern<gmir::XorOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gmir::XorOp Op,
+                                PatternRewriter &Rewriter) const override {
+    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+      auto Inner = Cand.getDefiningOp<gmir::XorOp>();
+      if (!Inner)
+        continue;
+      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+      if (Other == Inner.getLhs()) {
+        Rewriter.replaceOp(Op, Inner.getRhs());
+        return success();
+      }
+      if (Other == Inner.getRhs()) {
+        Rewriter.replaceOp(Op, Inner.getLhs());
+        return success();
+      }
+    }
+    return failure();
+  }
+};
 } // namespace
 
 const FrozenRewritePatternSet &
@@ -167,6 +314,19 @@ gmir::CombinerPatternCache::get(MLIRContext &Context, const TargetLowering *TLI,
   Patterns.add<MulNegOneToSubPattern>(&Context);
   Patterns.add<DisjointAddToOrPattern>(&Context,
                                        GMIRTargetLoweringAdapter(TLI, DL), Ctx);
+  Patterns.add<ReassociateConstOpPattern<gmir::AddOp>>(
+      &Context, +[](const APInt &A, const APInt &B) { return A + B; });
+  Patterns.add<ReassociateConstOpPattern<gmir::MulOp>>(
+      &Context, +[](const APInt &A, const APInt &B) { return A * B; });
+  Patterns.add<ReassociateConstOpPattern<gmir::AndOp>>(
+      &Context, +[](const APInt &A, const APInt &B) { return A & B; });
+  Patterns.add<ReassociateConstOpPattern<gmir::OrOp>>(
+      &Context, +[](const APInt &A, const APInt &B) { return A | B; });
+  Patterns.add<ReassociateConstOpPattern<gmir::XorOp>>(
+      &Context, +[](const APInt &A, const APInt &B) { return A ^ B; });
+  Patterns.add<RepeatedOperandIdempotentPattern<gmir::AndOp>>(&Context);
+  Patterns.add<RepeatedOperandIdempotentPattern<gmir::OrOp>>(&Context);
+  Patterns.add<XorSelfCancelPattern>(&Context);
 
   return Cache.try_emplace(Key, std::move(Patterns)).first->second;
 }
