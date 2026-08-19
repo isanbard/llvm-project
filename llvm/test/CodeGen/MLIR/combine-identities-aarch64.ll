@@ -116,6 +116,15 @@ define i32 @or_allones(i32 %x) {
 ; CHECK: gmir.constant -1
 ; CHECK: return
 
+define i32 @xor_self(i32 %x) {
+  %r = xor i32 %x, %x
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @xor_self
+; CHECK-NOT: gmir.xor
+; CHECK: gmir.constant 0
+; CHECK: return
+
 define i32 @xor_zero(i32 %x) {
   %r = xor i32 %x, 0
   ret i32 %r

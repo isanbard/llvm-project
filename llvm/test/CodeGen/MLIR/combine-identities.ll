@@ -166,6 +166,18 @@ define i32 @or_allones(i32 %x) {
 ; ASM-NOT: orl
 ; ASM: movl $-1, %eax
 
+define i32 @xor_self(i32 %x) {
+  %r = xor i32 %x, %x
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_self
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: xor_self:
+; ASM-NOT: xorl %eax, %edi
+; ASM: xorl %eax, %eax
+
 define i32 @xor_zero(i32 %x) {
   %r = xor i32 %x, 0
   ret i32 %r
@@ -337,3 +349,21 @@ define i32 @xor_self_cancel(i32 %a, i32 %b) {
 ; ASM-LABEL: xor_self_cancel:
 ; ASM-NOT: xorl
 ; ASM: movl %esi, %eax
+
+; Regression case for a real bug an expert review found: without
+; XorOp::fold's x^x->0 identity (added alongside this test), reducing
+; %n to %b here (via XorSelfCancelPattern above) rewires %r's operands
+; to (b, b) -- a live x^x that nothing folded away. With the fix, the
+; whole chain collapses to a constant.
+define i32 @xor_chain_self_cancel_then_zero(i32 %a, i32 %b) {
+  %m = xor i32 %a, %b
+  %n = xor i32 %m, %a
+  %r = xor i32 %n, %b
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_chain_self_cancel_then_zero
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: xor_chain_self_cancel_then_zero:
+; ASM: xorl %eax, %eax

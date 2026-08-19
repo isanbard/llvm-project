@@ -119,3 +119,25 @@ define i32 @xor_self_cancel(i32 %a, i32 %b) {
 ; ASM-LABEL: xor_self_cancel:
 ; ASM-NOT: eor
 ; ASM: mov w0, w1
+
+; Regression case for a real bug an expert review found: without
+; XorOp::fold's x^x->0 identity (added alongside this test, see
+; combine-identities.ll), reducing %n to %b here (via
+; XorSelfCancelPattern above) rewires %r's operands to (b, b) -- a live
+; x^x that nothing folded away. With the fix, the whole chain collapses
+; to a constant. Confirmed empirically that this genuinely diverges
+; from plain -global-isel on AArch64 too (its combiner leaves a real
+; `eor w0, w8, w8` rather than folding to zero), same reason the rest
+; of this file avoids the byte-diff oracle.
+define i32 @xor_chain_self_cancel_then_zero(i32 %a, i32 %b) {
+  %m = xor i32 %a, %b
+  %n = xor i32 %m, %a
+  %r = xor i32 %n, %b
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_chain_self_cancel_then_zero
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: xor_chain_self_cancel_then_zero:
+; ASM: mov w0, wzr

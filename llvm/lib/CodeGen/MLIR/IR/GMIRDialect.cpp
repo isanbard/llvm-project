@@ -199,6 +199,16 @@ OpFoldResult OrOp::fold(FoldAdaptor adaptor) {
 }
 
 OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
+  // x ^ x -> 0 (SSA value equality, not constant matching) -- same
+  // shape as SubOp::fold's x-x->0: needs a *new* constant rather than
+  // an existing operand, materialized into a real gmir.constant op by
+  // GMIRDialect::materializeConstant below. Without this, M5 slice 4's
+  // XorSelfCancelPattern can leave a live x^x behind (e.g. reducing
+  // `(a^b)^a` to `b` inside a larger xor chain can rewire a sibling use
+  // to become b^b) with nothing left to fold it away.
+  if (getLhs() == getRhs())
+    return makeGMIRConstAttr(getContext(), APInt::getZero(64));
+
   unsigned Width =
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);
