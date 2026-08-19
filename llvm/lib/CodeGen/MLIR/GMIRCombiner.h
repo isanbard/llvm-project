@@ -22,7 +22,12 @@
 // restructuring -- as real OpRewritePattern<OpTy> classes registered
 // into CombinerPatternCache, the same shape GMIRLegalizer.h uses (e.g.
 // slice 2's MulNegOneToSubPattern: `mul x, -1 -> sub(0, x)`, which needs
-// a brand-new gmir.sub op fold() can't emit). See
+// a brand-new gmir.sub op fold() can't emit), and (d), starting with M5
+// slice 3, hosting patterns gated on a genuine TargetLowering query (via
+// GMIRTargetLoweringAdapter in GMIRCombiner.cpp, the same shape
+// GMIRLegalizerInfoAdapter wraps LegalizerInfo in GMIRLegalizer.cpp) --
+// e.g. slice 3's DisjointAddToOrPattern: `add(and(a,C1), and(b,C2)) ->
+// or(...)` when the masks are disjoint and TLI reports OR legal. See
 // ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
 // design, including why -print-gmir-after-combine (not just the usual
 // -global-isel asm-diff) is the real proof this pass's own code ran on
@@ -36,26 +41,42 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
-#include <optional>
+#include "llvm/ADT/DenseMap.h"
+#include <utility>
 
 namespace llvm {
+class DataLayout;
+class LLVMContext;
+class MachineFunction;
+class TargetLowering;
+
 namespace gmir {
 
-/// Caches the FrozenRewritePatternSet gmir::combine() applies, built once
-/// and reused for the pass instance's lifetime. Unlike GMIRLegalizer.h's
-/// LegalizerPatternCache, this needs no per-target keying: slice 1's
-/// fold()-based identities have no LegalizerInfo/DataLayout dependency
-/// at all, and a future slice's DAGCombiner rule that genuinely needs a
-/// TargetLowering query is expected to call it directly from the
-/// pattern body (the same way GMIRLegalizerInfoAdapter wraps
-/// LegalizerInfo -- see design doc §1.20's decision #3), not by keying
-/// the whole pattern set on it. Revisit this simplification if a future
-/// slice's patterns turn out to need per-target-keyed caching after all.
+/// Caches the FrozenRewritePatternSet gmir::combine() applies, keyed by
+/// the (TargetLowering, DataLayout) pair the patterns were built to
+/// query -- same shape and same rationale as GMIRLegalizer.h's
+/// LegalizerPatternCache (see its doc comment for the full argument for
+/// why both pointers, not just TargetLowering, need to be part of the
+/// key). Meant to be owned as long-lived state by the caller (e.g. a
+/// MachineFunctionPass member), safe to cache across functions for the
+/// same reason LegalizerPatternCache is: the patterns' captured
+/// MLIRContext*/DataLayout&/TargetLowering* are all owned by the
+/// Module/TargetSubtargetInfo, which outlive any single
+/// MachineFunctionPass invocation.
 class CombinerPatternCache {
-  std::optional<mlir::FrozenRewritePatternSet> Cache;
+  llvm::DenseMap<std::pair<const TargetLowering *, const llvm::DataLayout *>,
+                 mlir::FrozenRewritePatternSet>
+      Cache;
 
 public:
-  const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context);
+  // Ctx (the LLVM IR LLVMContext, distinct from the mlir::MLIRContext
+  // Context parameter) is only used to build the patterns on a cache
+  // miss -- like Context itself, it's a per-call parameter, not part of
+  // the cache key.
+  const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context,
+                                           const TargetLowering *TLI,
+                                           const llvm::DataLayout &DL,
+                                           llvm::LLVMContext &Ctx);
 };
 
 /// Rewrites FuncOp in place: applies PatternCache's patterns (plus, for
@@ -65,8 +86,11 @@ public:
 /// Returns false only if applyPatternsGreedily itself fails (e.g.
 /// non-convergence) -- mirrors gmir::legalize()'s fallible-step
 /// convention used throughout this pipeline's caller,
-/// MLIRInstructionSelect.cpp.
-bool combine(mlir::func::FuncOp FuncOp, CombinerPatternCache &PatternCache);
+/// MLIRInstructionSelect.cpp. MF supplies the real TargetLowering/
+/// DataLayout/LLVMContext some patterns need to query (starting with M5
+/// slice 3), the same way gmir::legalize() uses it for LegalizerInfo.
+bool combine(mlir::func::FuncOp FuncOp, MachineFunction &MF,
+             CombinerPatternCache &PatternCache);
 
 } // namespace gmir
 } // namespace llvm
