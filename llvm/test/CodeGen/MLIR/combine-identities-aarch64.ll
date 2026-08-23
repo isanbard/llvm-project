@@ -179,3 +179,120 @@ define i32 @mul_neg_one_lhs(i32 %x) {
 ; CHECK: gmir.constant 0
 ; CHECK: gmir.sub
 ; CHECK: return
+
+; M5 slice 5's three new SubOp::fold arms (A-(A-B)->B, (A+B)-A->B,
+; (A+B)-B->A -- see combine-identities.ll). Tracing
+; AArch64O0PreLegalizerCombiner's real rule set (AArch64Combine.td)
+; predicted these would all diverge from plain -global-isel here (its
+; sub_add_reg rule, which covers this exact shape, is only wired into
+; the full, non-O0 AArch64PreLegalizerCombiner) -- empirically WRONG,
+; confirmed by actually running both and diffing: this file's default
+; (no explicit -O) invocation doesn't restrict -global-isel to the O0
+; combiner's trivial-only rule set the way that .td-level reasoning
+; assumed, so the byte-diff holds for all four functions below. Kept
+; here rather than a new non-byte-diff file for exactly that reason --
+; verified, not predicted, per this project's standing discipline.
+
+define i32 @sub_a_minus_a_minus_b(i32 %a, i32 %b) {
+  %t = sub i32 %a, %b
+  %r = sub i32 %a, %t
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @sub_a_minus_a_minus_b
+; CHECK-NOT: gmir.sub
+; CHECK: return %arg1
+
+define i32 @sub_double_neg(i32 %b) {
+  %t = sub i32 0, %b
+  %r = sub i32 0, %t
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @sub_double_neg
+; CHECK-NOT: gmir.sub
+; CHECK: return %arg0
+
+define i32 @sub_add_a(i32 %a, i32 %b) {
+  %t = add i32 %a, %b
+  %r = sub i32 %t, %a
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @sub_add_a
+; CHECK-NOT: gmir.add
+; CHECK-NOT: gmir.sub
+; CHECK: return %arg1
+
+define i32 @sub_add_b(i32 %a, i32 %b) {
+  %t = add i32 %a, %b
+  %r = sub i32 %t, %b
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @sub_add_b
+; CHECK-NOT: gmir.add
+; CHECK-NOT: gmir.sub
+; CHECK: return %arg0
+
+; SubMinusOneToXorPattern: sub(-1, x) -> xor(x, -1) -- see
+; combine-identities.ll. Confirmed byte-diff clean here too, same as
+; the four SubOp::fold identities above.
+define i32 @sub_neg_one_to_xor(i32 %x) {
+  %r = sub i32 -1, %x
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @sub_neg_one_to_xor
+; CHECK-NOT: gmir.sub
+; CHECK: gmir.constant -1
+; CHECK: gmir.xor
+; CHECK: return
+
+; XorAndDeMorganPattern: xor(and(x,y), y) -> and(xor(x,-1), y) -- see
+; combine-identities.ll. Confirmed byte-diff clean here too, including
+; the negative hasOneUse() multiuse case (trivially, since nothing
+; changes there).
+
+define i32 @xor_and_demorgan_lhs(i32 %x, i32 %y) {
+  %m = and i32 %x, %y
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @xor_and_demorgan_lhs
+; CHECK-NOT: gmir.and %arg0, %arg1
+; CHECK: gmir.constant -1
+; CHECK: gmir.xor %arg0
+; CHECK: gmir.and
+; CHECK: return
+
+define i32 @xor_and_demorgan_rhs(i32 %x, i32 %y) {
+  %m = and i32 %x, %y
+  %r = xor i32 %y, %m
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @xor_and_demorgan_rhs
+; CHECK-NOT: gmir.and %arg0, %arg1
+; CHECK: gmir.constant -1
+; CHECK: gmir.xor %arg0
+; CHECK: gmir.and
+; CHECK: return
+
+define i32 @xor_and_demorgan_and_swapped(i32 %x, i32 %y) {
+  %m = and i32 %y, %x
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @xor_and_demorgan_and_swapped
+; CHECK-NOT: gmir.and %arg1, %arg0
+; CHECK: gmir.constant -1
+; CHECK: gmir.xor %arg0
+; CHECK: gmir.and
+; CHECK: return
+
+define i32 @xor_and_demorgan_multiuse(i32 %x, i32 %y, ptr %out) {
+  %m = and i32 %x, %y
+  store i32 %m, ptr %out
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; CHECK-LABEL: func.func @xor_and_demorgan_multiuse
+; CHECK: gmir.and %arg0, %arg1
+; CHECK-NOT: gmir.constant -1
+; CHECK: gmir.xor
+; CHECK: return

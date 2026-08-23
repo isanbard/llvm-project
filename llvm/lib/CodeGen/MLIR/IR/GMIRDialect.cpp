@@ -98,6 +98,30 @@ OpFoldResult SubOp::fold(FoldAdaptor adaptor) {
   if (getLhs() == getRhs())
     return makeGMIRConstAttr(getContext(), APInt::getZero(64));
 
+  // A - (A - B) -> B (DAGCombiner.cpp:4406-4408, unconditional). SSA
+  // value equality, same shape as x-x->0 above -- this also covers the
+  // 0 - (0 - B) -> B double-negation special case "for free" whenever
+  // the same zero-valued SSA Value is literally reused for both A
+  // occurrences (a separately materialized zero wouldn't match here
+  // without CSE running first to unify them -- same SSA-equality-only
+  // caveat every x-x-shaped check in this file already has).
+  if (auto InnerSub = getRhs().getDefiningOp<SubOp>())
+    if (InnerSub.getLhs() == getLhs())
+      return InnerSub.getRhs();
+
+  // (A + B) - A -> B and (A + B) - B -> A (DAGCombiner.cpp:4410-4416,
+  // both unconditional). gmir.add is Commutative but that trait alone
+  // doesn't canonicalize operand order, so both of A+B's operand
+  // positions must be checked explicitly, same reasoning as every
+  // dual-order check elsewhere in this pipeline.
+  if (auto InnerAdd = getLhs().getDefiningOp<AddOp>()) {
+    if (InnerAdd.getLhs() == getRhs())
+      return InnerAdd.getRhs();
+
+    if (InnerAdd.getRhs() == getRhs())
+      return InnerAdd.getLhs();
+  }
+
   unsigned Width =
       cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
   auto Lhs = getGMIRConstOperand(adaptor.getLhs(), Width);

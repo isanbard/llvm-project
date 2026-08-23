@@ -32,6 +32,13 @@
 // and repeated-operand identities (`(x+c1)+c2 -> x+(c1+c2)`, `(a&b)&a
 // -> a&b`, `(a^b)^a -> b`) -- ported from a single DAGCombiner.cpp
 // helper (reassociateOpsCommutative) shared by visitADD/MUL/AND/OR/XOR.
+// M5 slice 5 gives gmir.sub its first real combiner coverage beyond
+// x-x->0: three new SubOp::fold() arms (`A-(A-B) -> B`, `(A+B)-A -> B`,
+// `(A+B)-B -> A`, all SSA-equality-based like x-x->0), plus two new
+// patterns, `sub(-1,x) -> xor(x,-1)` (SubMinusOneToXorPattern) and
+// `xor(and(x,y),y) -> and(xor(x,-1),y)` (XorAndDeMorganPattern, the
+// first hasOneUse()-gated pattern in this file -- a structural
+// profitability check, not a TargetLowering query).
 // See ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
 // design, including why -print-gmir-after-combine (not just the usual
 // -global-isel asm-diff) is the real proof this pass's own code ran on

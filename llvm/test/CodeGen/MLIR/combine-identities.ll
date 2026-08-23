@@ -367,3 +367,155 @@ define i32 @xor_chain_self_cancel_then_zero(i32 %a, i32 %b) {
 ; GMIR: return
 ; ASM-LABEL: xor_chain_self_cancel_then_zero:
 ; ASM: xorl %eax, %eax
+
+; M5 slice 5's three new SubOp::fold arms (DAGCombiner.cpp:4406-4416):
+; A-(A-B)->B, (A+B)-A->B, (A+B)-B->A. All SSA-equality-based, same shape
+; as sub_self's existing x-x->0 above -- each collapses both the inner
+; and outer sub/add entirely, down to a bare return of one operand.
+
+define i32 @sub_a_minus_a_minus_b(i32 %a, i32 %b) {
+  %t = sub i32 %a, %b
+  %r = sub i32 %a, %t
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @sub_a_minus_a_minus_b
+; GMIR-NOT: gmir.sub
+; GMIR: return %arg1
+; ASM-LABEL: sub_a_minus_a_minus_b:
+; ASM-NOT: subl
+; ASM: movl %esi, %eax
+
+; A-(A-B)->B's A=0 instantiation (double negation, 0-(0-B)->B) --
+; deliberately NOT a separate fold() arm, falls out of the same general
+; rule above "for free" because GMIRImporter's constant memoization maps
+; both literal `0` operands to the identical materialized gmir.constant
+; Value, satisfying the general rule's SSA-equality check on A.
+define i32 @sub_double_neg(i32 %b) {
+  %t = sub i32 0, %b
+  %r = sub i32 0, %t
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @sub_double_neg
+; GMIR-NOT: gmir.sub
+; GMIR: return %arg0
+; ASM-LABEL: sub_double_neg:
+; ASM-NOT: negl
+; ASM: movl %edi, %eax
+
+define i32 @sub_add_a(i32 %a, i32 %b) {
+  %t = add i32 %a, %b
+  %r = sub i32 %t, %a
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @sub_add_a
+; GMIR-NOT: gmir.add
+; GMIR-NOT: gmir.sub
+; GMIR: return %arg1
+; ASM-LABEL: sub_add_a:
+; ASM-NOT: addl
+; ASM-NOT: subl
+; ASM: movl %esi, %eax
+
+define i32 @sub_add_b(i32 %a, i32 %b) {
+  %t = add i32 %a, %b
+  %r = sub i32 %t, %b
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @sub_add_b
+; GMIR-NOT: gmir.add
+; GMIR-NOT: gmir.sub
+; GMIR: return %arg0
+; ASM-LABEL: sub_add_b:
+; ASM-NOT: addl
+; ASM-NOT: subl
+; ASM: movl %edi, %eax
+
+; M5 slice 5's SubMinusOneToXorPattern: sub(-1, x) -> xor(x, -1)
+; (DAGCombiner.cpp:4398-4400). gmir.sub isn't Commutative, so unlike
+; MulNegOneToSubPattern's both-orders test above, sub(x, -1) is a
+; genuinely different value (x+1, not this identity) and deliberately
+; has no parallel "other order" test here.
+define i32 @sub_neg_one_to_xor(i32 %x) {
+  %r = sub i32 -1, %x
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @sub_neg_one_to_xor
+; GMIR-NOT: gmir.sub
+; GMIR: gmir.constant -1
+; GMIR: gmir.xor
+; GMIR: return
+; ASM-LABEL: sub_neg_one_to_xor:
+; ASM-NOT: subl
+; ASM: notl %eax
+
+; M5 slice 5's XorAndDeMorganPattern: xor(and(x,y), y) -> and(xor(x,-1),
+; y) (DAGCombiner.cpp:10638-10644, hasOneUse()-gated -- the first
+; hasOneUse()-gated pattern in this file). DAGCombiner's own rule only
+; checks one of 4 structurally equivalent operand-order combinations;
+; this pattern deliberately generalizes to all 4 (see GMIRCombiner.cpp's
+; doc comment) -- the three positive tests below cover 3 of those
+; combinations (the 4th, and's-RHS-swapped + xor's-RHS-swapped, is
+; algebraically identical to xor_and_demorgan_and_swapped modulo which
+; xor operand is checked first, not a distinct code path worth a 4th
+; test), plus a negative test proving the hasOneUse() gate actually
+; gates something.
+
+define i32 @xor_and_demorgan_lhs(i32 %x, i32 %y) {
+  %m = and i32 %x, %y
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_and_demorgan_lhs
+; GMIR-NOT: gmir.and %arg0, %arg1
+; GMIR: gmir.constant -1
+; GMIR: gmir.xor %arg0
+; GMIR: gmir.and
+; GMIR: return
+; ASM-LABEL: xor_and_demorgan_lhs:
+; ASM-NOT: xorl
+
+define i32 @xor_and_demorgan_rhs(i32 %x, i32 %y) {
+  %m = and i32 %x, %y
+  %r = xor i32 %y, %m
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_and_demorgan_rhs
+; GMIR-NOT: gmir.and %arg0, %arg1
+; GMIR: gmir.constant -1
+; GMIR: gmir.xor %arg0
+; GMIR: gmir.and
+; GMIR: return
+; ASM-LABEL: xor_and_demorgan_rhs:
+; ASM-NOT: xorl
+
+define i32 @xor_and_demorgan_and_swapped(i32 %x, i32 %y) {
+  %m = and i32 %y, %x
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_and_demorgan_and_swapped
+; GMIR-NOT: gmir.and %arg1, %arg0
+; GMIR: gmir.constant -1
+; GMIR: gmir.xor %arg0
+; GMIR: gmir.and
+; GMIR: return
+; ASM-LABEL: xor_and_demorgan_and_swapped:
+; ASM-NOT: xorl
+
+; Negative test: %m is also returned directly (a second use), so the
+; hasOneUse() gate must block the rewrite -- the original xor(and,y)
+; shape must survive unchanged.
+define i32 @xor_and_demorgan_multiuse(i32 %x, i32 %y, ptr %out) {
+  %m = and i32 %x, %y
+  store i32 %m, ptr %out
+  %r = xor i32 %m, %y
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_and_demorgan_multiuse
+; GMIR: gmir.and %arg0, %arg1
+; GMIR-NOT: gmir.constant -1
+; GMIR: gmir.xor
+; GMIR: return
+; ASM-LABEL: xor_and_demorgan_multiuse:
+; ASM: andl
+; ASM: xorl

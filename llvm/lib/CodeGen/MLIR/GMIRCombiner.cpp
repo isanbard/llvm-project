@@ -127,6 +127,100 @@ public:
   }
 };
 
+/// `sub(-1, x) -> xor(x, -1)` (DAGCombiner.cpp:4398-4400, "Canonicalize
+/// (sub -1, x) -> ~x" -- unconditional, no TLI/legality/hasOneUse()
+/// gating, same shape as MulNegOneToSubPattern above). Needs a genuine
+/// OpRewritePattern, not fold(): the result (~x) isn't equal to either
+/// existing operand of the sub, so it has to emit a brand-new gmir.xor.
+/// gmir.sub is deliberately NOT Commutative (subtraction isn't), so
+/// unlike matchConstOperand's dual-order shape, only the LHS position is
+/// meaningful here -- sub(x, -1) is a completely different value (x+1),
+/// not this identity -- so this checks getLhs() only via matchPattern/
+/// m_Constant directly, rather than matchConstOperand (which would
+/// wrongly also match the sub(x,-1) shape).
+class SubMinusOneToXorPattern : public OpRewritePattern<gmir::SubOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gmir::SubOp Op,
+                                PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    unsigned Width = DstGTy.getScalarSizeInBits();
+
+    IntegerAttr C;
+    if (!matchPattern(Op.getLhs(), m_Constant(&C)) ||
+        !C.getValue().trunc(Width).isAllOnes())
+      return failure();
+
+    Location Loc = Op.getLoc();
+    IntegerAttr NegOneAttr =
+        makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
+    auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
+    Rewriter.replaceOpWithNewOp<gmir::XorOp>(Op, DstGTy, Op.getRhs(),
+                                             NegOne.getResult());
+    return success();
+  }
+};
+
+/// `xor(and(x,y), y) -> and(xor(x,-1), y)` (DAGCombiner.cpp:10638-10644,
+/// N0.hasOneUse()-gated -- the first hasOneUse()-gated pattern in this
+/// file, ported directly from DAGCombiner's own gate rather than
+/// invented; confirmed no existing precedent for this gate elsewhere in
+/// GMIRCombiner.cpp/GMIRLegalizer.cpp). Introducing a second gmir.and
+/// only pays off if the matched and's result isn't needed elsewhere, so
+/// this is a structural profitability check, not a TLI/legality query.
+///
+/// DAGCombiner's own call site only checks ONE of 4 structurally
+/// equivalent shapes (AND must be N0, and N0's *second* operand must
+/// equal N1) -- visitXOR only ever canonicalizes a *constant* operand to
+/// the RHS, never reorders two non-constant operands. gmir has no
+/// automatic canonicalization either, same reasoning as every other
+/// dual-order check in this pipeline, so this pattern deliberately
+/// generalizes to all 4 combinations (both gmir.xor operand orders x
+/// both gmir.and operand orders) rather than literally porting the
+/// single shape DAGCombiner happens to check. Doesn't reuse
+/// matchRepeatedOperand<OpTy> (unlike XorSelfCancelPattern above): that
+/// helper's Inner and Outer op are the same OpTy by construction, but
+/// here Outer is XorOp and Inner is AndOp -- a genuinely different,
+/// two-op-type shape, not worth generalizing the helper for in this
+/// slice.
+class XorAndDeMorganPattern : public OpRewritePattern<gmir::XorOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(gmir::XorOp Op,
+                                PatternRewriter &Rewriter) const override {
+    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+      auto And = Cand.getDefiningOp<gmir::AndOp>();
+      if (!And || !And.getResult().hasOneUse())
+        continue;
+
+      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+      mlir::Value X;
+      if (Other == And.getRhs())
+        X = And.getLhs();
+      else if (Other == And.getLhs())
+        X = And.getRhs();
+      else
+        continue;
+
+      auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+      unsigned Width = DstGTy.getScalarSizeInBits();
+      Location Loc = Op.getLoc();
+      IntegerAttr NegOneAttr =
+          makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
+      auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
+      auto NotX =
+          gmir::XorOp::create(Rewriter, Loc, DstGTy, X, NegOne.getResult());
+      Rewriter.replaceOpWithNewOp<gmir::AndOp>(Op, DstGTy, NotX.getResult(),
+                                               Other);
+      return success();
+    }
+
+    return failure();
+  }
+};
+
 /// Wraps a target's real TargetLowering the same way GMIRLegalizer.cpp's
 /// GMIRLegalizerInfoAdapter wraps LegalizerInfo, for patterns (starting
 /// with DisjointAddToOrPattern below) that need a genuine cost/legality
@@ -325,6 +419,8 @@ gmir::CombinerPatternCache::get(MLIRContext &Context, const TargetLowering *TLI,
 
   RewritePatternSet Patterns(&Context);
   Patterns.add<MulNegOneToSubPattern>(&Context);
+  Patterns.add<SubMinusOneToXorPattern>(&Context);
+  Patterns.add<XorAndDeMorganPattern>(&Context);
   Patterns.add<DisjointAddToOrPattern>(&Context,
                                        GMIRTargetLoweringAdapter(TLI, DL), Ctx);
   Patterns.add<ReassociateConstOpPattern<gmir::AddOp>>(
