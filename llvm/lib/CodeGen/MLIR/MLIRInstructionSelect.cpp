@@ -171,11 +171,16 @@ public:
     // AArch64 addressing mode without this. createMIRBuilder is shared
     // with IRTranslator itself (Utils.h) for exactly this "CSEMIRBuilder
     // wired to CSEInfo, or plain MachineIRBuilder" mechanics.
+    //
+    // TargetPassConfig::isGISelCSEEnabled() was removed upstream --
+    // IRTranslatorLegacy::runOnMachineFunction now fetches the CSE wrapper
+    // unconditionally (the enable/disable decision lives solely in
+    // IRTranslator's own -enable-cse-in-irtranslator-gated local bool).
+    // Mirror that unconditional fetch here.
     auto &TPC = getAnalysis<TargetPassConfig>();
-    GISelCSEInfo *CSEInfo = nullptr;
-    if (TPC.isGISelCSEEnabled())
-      CSEInfo = &getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
-          TPC.getCSEConfig());
+    GISelCSEInfo *CSEInfo =
+        &getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper().get(
+            TPC.getCSEConfig());
 
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
