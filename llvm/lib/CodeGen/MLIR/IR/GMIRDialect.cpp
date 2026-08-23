@@ -16,6 +16,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/Support/AtomicOrdering.h"
 
 using namespace mlir;
@@ -249,6 +250,40 @@ OpFoldResult XorOp::fold(FoldAdaptor adaptor) {
     return makeGMIRConstAttr(getContext(), *Lhs ^ *Rhs);
 
   return {};
+}
+
+// icmp cc X, X -> true/false (SelectionDAG::FoldSetCC, SelectionDAG.cpp:
+// 2783-2786 -- the first thing SimplifySetCC checks). SSA value equality,
+// not constant matching, same shape as SubOp::fold's x-x->0/XorOp::fold's
+// x^x->0.
+//
+// Materializing a plain 0/1 constant (rather than querying
+// TargetLowering::getBooleanContents the way SelectionDAG's
+// getBoolConstant/GlobalISel's own getICmpTrueVal do -- see
+// CombinerHelper::matchICmpToTrueFalseKnownBits, CombinerHelper.cpp) is
+// safe specifically because gmir.icmp has exactly one producer in this
+// pipeline (GMIRImporter::importICmp), whose $res type derives from
+// llvm::ICmpInst::getType() -- always i1 (or a vector of i1) by LLVM IR's
+// own verifier rules. At a literal 1-bit width, every BooleanContent
+// kind's "true" value (1, -1, or don't-care) truncates to the identical
+// bit pattern, so the distinction is moot here -- unlike real GlobalISel's
+// G_ICMP in general, which genuinely is target-dependent (see
+// llvm/docs/GlobalISel/GenericOpcode.rst's G_ICMP entry). Bails out below
+// rather than assuming this holds if gmir.icmp ever grows a second,
+// wider-result producer.
+OpFoldResult ICmpOp::fold(FoldAdaptor adaptor) {
+  if (getLhs() != getRhs())
+    return {};
+
+  unsigned Width =
+      cast<gmir::LLTType>(getResult().getType()).getScalarSizeInBits();
+  if (Width != 1)
+    return {};
+
+  auto Pred = static_cast<CmpInst::Predicate>(
+      getPredicateAttr().getValue().getSExtValue());
+  return makeGMIRConstAttr(getContext(),
+                           APInt(Width, CmpInst::isTrueWhenEqual(Pred)));
 }
 
 // GMIRDialect::materializeConstant -- lets the greedy pattern rewrite

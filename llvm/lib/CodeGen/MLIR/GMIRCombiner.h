@@ -38,7 +38,14 @@
 // patterns, `sub(-1,x) -> xor(x,-1)` (SubMinusOneToXorPattern) and
 // `xor(and(x,y),y) -> and(xor(x,-1),y)` (XorAndDeMorganPattern, the
 // first hasOneUse()-gated pattern in this file -- a structural
-// profitability check, not a TargetLowering query).
+// profitability check, not a TargetLowering query). M5 slice 6 gives
+// gmir.icmp its first combiner coverage: a reflexive `icmp cc X, X ->
+// true/false` fold() (IR/GMIRDialect.cpp), the unconditional
+// `(X op Y) cmp (X op Z) -> Y cmp Z` / `(X op Y) cmp X/Y -> Y/X cmp 0`
+// cancellation family for op in {add, sub, xor} (ICmpSameBinOpPattern/
+// ICmpBinOpEqOtherPattern), and the hasOneUse()-gated constant-adjustment
+// folds `(X op C1) cmp C2 -> X cmp combine(C1,C2)` for op in
+// {add, xor, sub} (ICmpConstAdjustPattern/ICmpSubConstPattern).
 // See ~/llvm/mlir_instruction_selection_plan.md's M5 section for the full
 // design, including why -print-gmir-after-combine (not just the usual
 // -global-isel asm-diff) is the real proof this pass's own code ran on

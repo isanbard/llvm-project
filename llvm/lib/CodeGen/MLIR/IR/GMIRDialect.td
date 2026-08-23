@@ -141,6 +141,7 @@ def GMIR_ICmpOp : GMIR_Op<"icmp", [Pure]> {
   }];
   let arguments = (ins I64Attr:$predicate, GMIR_LLTType:$lhs, GMIR_LLTType:$rhs);
   let results = (outs GMIR_LLTType:$res);
+  let hasFolder = 1;
 }
 
 def GMIR_BrOp : GMIR_Op<"br", [Pure, Terminator,

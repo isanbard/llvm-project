@@ -519,3 +519,308 @@ define i32 @xor_and_demorgan_multiuse(i32 %x, i32 %y, ptr %out) {
 ; ASM-LABEL: xor_and_demorgan_multiuse:
 ; ASM: andl
 ; ASM: xorl
+
+; M5 slice 6's ICmpOp::fold: icmp cc X, X -> true/false
+; (SelectionDAG::FoldSetCC, the first thing SimplifySetCC checks), via
+; CmpInst::isTrueWhenEqual. EQ/SLE are true-when-equal; NE/SLT are not.
+define i1 @icmp_eq_self(i32 %x) {
+  %r = icmp eq i32 %x, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_eq_self
+; GMIR-NOT: gmir.icmp
+; GMIR: gmir.constant -1
+; GMIR: return
+; ASM-LABEL: icmp_eq_self:
+; ASM-NOT: cmpl
+; ASM: movb $1, %al
+
+define i1 @icmp_ne_self(i32 %x) {
+  %r = icmp ne i32 %x, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_ne_self
+; GMIR-NOT: gmir.icmp
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: icmp_ne_self:
+; ASM-NOT: cmpl
+; ASM: xorl %eax, %eax
+
+define i1 @icmp_slt_self(i32 %x) {
+  %r = icmp slt i32 %x, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_slt_self
+; GMIR-NOT: gmir.icmp
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: icmp_slt_self:
+; ASM-NOT: cmpl
+; ASM: xorl %eax, %eax
+
+define i1 @icmp_sle_self(i32 %x) {
+  %r = icmp sle i32 %x, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_sle_self
+; GMIR-NOT: gmir.icmp
+; GMIR: gmir.constant -1
+; GMIR: return
+; ASM-LABEL: icmp_sle_self:
+; ASM-NOT: cmpl
+; ASM: movb $1, %al
+
+; M5 slice 6's ICmpSameBinOpPattern: (X op Y) == (X op Z) -> Y == Z for
+; op in {add, sub, xor} (TargetLowering.cpp:5722-5741). Checks both
+; "aligned" operand pairings unconditionally, plus (for commutative
+; add/xor only) the two "swapped" pairings.
+define i1 @icmp_same_add(i32 %x, i32 %y, i32 %z) {
+  %a = add i32 %x, %y
+  %b = add i32 %x, %z
+  %r = icmp eq i32 %a, %b
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_same_add
+; GMIR-NOT: gmir.add
+; GMIR: gmir.icmp"(%arg1, %arg2)
+; GMIR: return
+; ASM-LABEL: icmp_same_add:
+; ASM-NOT: addl
+; ASM: cmpl
+
+; Swapped-operand-order case: only sound for commutative inner ops.
+define i1 @icmp_same_add_swapped(i32 %x, i32 %y, i32 %z) {
+  %a = add i32 %x, %y
+  %b = add i32 %z, %x
+  %r = icmp ne i32 %a, %b
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_same_add_swapped
+; GMIR-NOT: gmir.add
+; GMIR: gmir.icmp"(%arg1, %arg2)
+; GMIR: return
+; ASM-LABEL: icmp_same_add_swapped:
+; ASM-NOT: addl
+; ASM: cmpl
+
+define i1 @icmp_same_sub(i32 %x, i32 %y, i32 %z) {
+  %a = sub i32 %x, %y
+  %b = sub i32 %x, %z
+  %r = icmp eq i32 %a, %b
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_same_sub
+; GMIR-NOT: gmir.sub
+; GMIR: gmir.icmp"(%arg1, %arg2)
+; GMIR: return
+; ASM-LABEL: icmp_same_sub:
+; ASM-NOT: subl
+; ASM: cmpl
+
+define i1 @icmp_same_xor(i32 %x, i32 %y, i32 %z) {
+  %a = xor i32 %x, %y
+  %b = xor i32 %x, %z
+  %r = icmp eq i32 %a, %b
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_same_xor
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.icmp"(%arg1, %arg2)
+; GMIR: return
+; ASM-LABEL: icmp_same_xor:
+; ASM-NOT: xorl %e{{[a-z0-9]+}}, %e{{[a-z0-9]+}}
+; ASM: cmpl
+
+; M5 slice 6's ICmpBinOpEqOtherPattern: (X op Y)==X -> Y==0 for
+; op in {add, sub, xor} (foldSetCCWithBinOp, TargetLowering.cpp:
+; 4596-4632), and (X op Y)==Y -> X==0 for op in {add, xor} only -- sub's
+; Y==N1 sibling needs a shift op gmir doesn't have, deliberately
+; excluded (icmp_subxy_eqy below confirms it's left untouched).
+define i1 @icmp_addy_eqx(i32 %x, i32 %y) {
+  %a = add i32 %x, %y
+  %r = icmp eq i32 %a, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_addy_eqx
+; GMIR-NOT: gmir.add
+; GMIR: gmir.constant 0
+; GMIR: gmir.icmp"(%arg1
+; GMIR: return
+; ASM-LABEL: icmp_addy_eqx:
+; ASM-NOT: addl
+; ASM: cmpl $0, %esi
+
+define i1 @icmp_addy_eqy(i32 %x, i32 %y) {
+  %a = add i32 %x, %y
+  %r = icmp eq i32 %a, %y
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_addy_eqy
+; GMIR-NOT: gmir.add
+; GMIR: gmir.constant 0
+; GMIR: gmir.icmp"(%arg0
+; GMIR: return
+; ASM-LABEL: icmp_addy_eqy:
+; ASM-NOT: addl
+; ASM: cmpl $0, %edi
+
+define i1 @icmp_subxy_eqx(i32 %x, i32 %y) {
+  %a = sub i32 %x, %y
+  %r = icmp eq i32 %a, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_subxy_eqx
+; GMIR-NOT: gmir.sub
+; GMIR: gmir.constant 0
+; GMIR: gmir.icmp"(%arg1
+; GMIR: return
+; ASM-LABEL: icmp_subxy_eqx:
+; ASM-NOT: subl
+; ASM: cmpl $0, %esi
+
+; Negative test: sub's Y==N1 form is deliberately not implemented (would
+; need a shift op) -- both the sub and the icmp must survive unchanged.
+define i1 @icmp_subxy_eqy(i32 %x, i32 %y) {
+  %a = sub i32 %x, %y
+  %r = icmp eq i32 %a, %y
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_subxy_eqy
+; GMIR: gmir.sub
+; GMIR: gmir.icmp
+; GMIR: return
+; ASM-LABEL: icmp_subxy_eqy:
+; ASM: subl
+; ASM: cmpl
+
+define i1 @icmp_xor_eqx(i32 %x, i32 %y) {
+  %a = xor i32 %x, %y
+  %r = icmp eq i32 %a, %x
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_xor_eqx
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: gmir.icmp"(%arg1
+; GMIR: return
+; ASM-LABEL: icmp_xor_eqx:
+; ASM-NOT: xorl %e{{[a-z0-9]+}}, %e{{[a-z0-9]+}}
+; ASM: cmpl $0, %esi
+
+define i1 @icmp_xor_eqy(i32 %x, i32 %y) {
+  %a = xor i32 %x, %y
+  %r = icmp eq i32 %a, %y
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_xor_eqy
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: gmir.icmp"(%arg0
+; GMIR: return
+; ASM-LABEL: icmp_xor_eqy:
+; ASM-NOT: xorl %e{{[a-z0-9]+}}, %e{{[a-z0-9]+}}
+; ASM: cmpl $0, %edi
+
+; M5 slice 6's ICmpConstAdjustPattern/ICmpSubConstPattern: (X op C1)==C2
+; -> X==combine(C1,C2) for op in {add, xor, sub} (TargetLowering.cpp:
+; 5750-5773), hasOneUse()-gated on the inner op, no TLI query.
+define i1 @icmp_add_const_adjust(i32 %x) {
+  %a = add i32 %x, 5
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_add_const_adjust
+; GMIR-NOT: gmir.add
+; GMIR: gmir.constant 5
+; GMIR: gmir.icmp"(%arg0
+; GMIR: return
+; ASM-LABEL: icmp_add_const_adjust:
+; ASM-NOT: addl
+; ASM: cmpl $5, %edi
+
+define i1 @icmp_xor_const_adjust(i32 %x) {
+  %a = xor i32 %x, 5
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_xor_const_adjust
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 15
+; GMIR: gmir.icmp"(%arg0
+; GMIR: return
+; ASM-LABEL: icmp_xor_const_adjust:
+; ASM-NOT: xorl
+; ASM: cmpl $15, %edi
+
+; C1 is specifically the sub's LHS -- gmir.sub isn't Commutative, same
+; non-commutative-specific treatment as SubMinusOneToXorPattern.
+define i1 @icmp_sub_const_adjust(i32 %x) {
+  %a = sub i32 20, %x
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_sub_const_adjust
+; GMIR-NOT: gmir.sub
+; GMIR: gmir.constant 10
+; GMIR: gmir.icmp"(%arg0
+; GMIR: return
+; ASM-LABEL: icmp_sub_const_adjust:
+; ASM: cmpl $10, %edi
+
+; Negative tests: %a is also stored (a second use), so the hasOneUse()
+; gate must block each rewrite.
+define i1 @icmp_add_const_multiuse(i32 %x, ptr %out) {
+  %a = add i32 %x, 5
+  store i32 %a, ptr %out
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_add_const_multiuse
+; GMIR: gmir.add
+; GMIR: gmir.icmp
+; GMIR: return
+; ASM-LABEL: icmp_add_const_multiuse:
+; ASM: addl
+; ASM: cmpl $10
+
+define i1 @icmp_xor_const_multiuse(i32 %x, ptr %out) {
+  %a = xor i32 %x, 5
+  store i32 %a, ptr %out
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_xor_const_multiuse
+; GMIR: gmir.xor
+; GMIR: gmir.icmp
+; GMIR: return
+; ASM-LABEL: icmp_xor_const_multiuse:
+; ASM: xorl
+; ASM: cmpl $10
+
+define i1 @icmp_sub_const_multiuse(i32 %x, ptr %out) {
+  %a = sub i32 20, %x
+  store i32 %a, ptr %out
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_sub_const_multiuse
+; GMIR: gmir.sub
+; GMIR: gmir.icmp
+; GMIR: return
+; ASM-LABEL: icmp_sub_const_multiuse:
+; ASM: cmpl $10
+
+; Wrong-side test: sub(X, C1) is a different value (X-C1, not C1-X) and
+; must NOT trigger ICmpSubConstPattern.
+define i1 @icmp_sub_wrong_side(i32 %x) {
+  %a = sub i32 %x, 20
+  %r = icmp eq i32 %a, 10
+  ret i1 %r
+}
+; GMIR-LABEL: func.func @icmp_sub_wrong_side
+; GMIR: gmir.sub
+; GMIR: gmir.icmp
+; GMIR: return
+; ASM-LABEL: icmp_sub_wrong_side:
+; ASM: cmpl $10
