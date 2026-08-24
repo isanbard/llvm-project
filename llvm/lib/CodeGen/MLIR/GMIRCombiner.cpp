@@ -626,7 +626,7 @@ public:
 const FrozenRewritePatternSet &
 gmir::CombinerPatternCache::get(MLIRContext &Context, const TargetLowering *TLI,
                                 const llvm::DataLayout &DL, LLVMContext &Ctx) {
-  auto Key = std::make_pair(TLI, &DL);
+  auto Key = std::make_tuple(TLI, &DL, &Ctx);
   auto It = Cache.find(Key);
   if (It != Cache.end())
     return It->second;

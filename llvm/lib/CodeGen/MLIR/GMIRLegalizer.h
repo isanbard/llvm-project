@@ -29,6 +29,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/CodeGen/GlobalISel/LegalizerInfo.h"
+#include <optional>
 #include <utility>
 
 namespace llvm {
@@ -37,6 +39,19 @@ class LegalizerInfo;
 class MachineFunction;
 
 namespace gmir {
+
+/// Returns {NarrowTy, NumParts} if Step is an exact, leftover-free,
+/// purely-scalar NarrowScalar split of DstTy; std::nullopt otherwise (not
+/// NarrowScalar, the split isn't exact, or either type is a vector -- see
+/// the definition in GMIRLegalizer.cpp for the full rationale, including
+/// why the vector exclusion is required for correctness). Declared here
+/// (rather than kept file-local `static`) solely so
+/// unittests/CodeGen/MLIR/GMIRLegalizerTest.cpp can exercise it directly
+/// against synthetic LegalizeActionStep/LLT values that no in-tree
+/// target's real LegalizerInfo currently produces -- every other
+/// consumer is GMIRLegalizer.cpp itself.
+std::optional<std::pair<LLT, unsigned>>
+getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy);
 
 /// Caches the FrozenRewritePatternSet gmir::legalize() builds, keyed by
 /// the (LegalizerInfo, DataLayout) pair the patterns were built to query

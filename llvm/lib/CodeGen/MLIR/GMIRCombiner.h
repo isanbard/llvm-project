@@ -60,6 +60,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
 #include "llvm/ADT/DenseMap.h"
+#include <tuple>
 #include <utility>
 
 namespace llvm {
@@ -71,18 +72,28 @@ class TargetLowering;
 namespace gmir {
 
 /// Caches the FrozenRewritePatternSet gmir::combine() applies, keyed by
-/// the (TargetLowering, DataLayout) pair the patterns were built to
-/// query -- same shape and same rationale as GMIRLegalizer.h's
-/// LegalizerPatternCache (see its doc comment for the full argument for
-/// why both pointers, not just TargetLowering, need to be part of the
-/// key). Meant to be owned as long-lived state by the caller (e.g. a
-/// MachineFunctionPass member), safe to cache across functions for the
+/// (TargetLowering, DataLayout, LLVMContext) -- same shape and same
+/// rationale as GMIRLegalizer.h's LegalizerPatternCache (see its doc
+/// comment for the full argument for why more than just TargetLowering
+/// needs to be part of the key), extended with LLVMContext specifically
+/// because DisjointAddToOrPattern (GMIRCombiner.cpp) captures an
+/// `LLVMContext &` at cache-population time and reuses it on every later
+/// matchAndRewrite call -- unlike LegalizerInfo/DataLayout, whose
+/// lifetimes track the TargetSubtargetInfo, an LLVMContext's lifetime
+/// tracks the Module being compiled. Omitting it from the key would let
+/// a stale cache hit (same TLI/DL pointers, reused for a different
+/// Module/LLVMContext in a long-lived embedding that recompiles multiple
+/// Modules) hand back a pattern set holding a dangling context
+/// reference. Meant to be owned as long-lived state by the caller (e.g.
+/// a MachineFunctionPass member), safe to cache across functions for the
 /// same reason LegalizerPatternCache is: the patterns' captured
-/// MLIRContext*/DataLayout&/TargetLowering* are all owned by the
-/// Module/TargetSubtargetInfo, which outlive any single
-/// MachineFunctionPass invocation.
+/// MLIRContext*/DataLayout&/TargetLowering*/LLVMContext& are all owned
+/// by the Module/TargetSubtargetInfo, which outlive any single
+/// MachineFunctionPass invocation -- just not across a Module boundary,
+/// which the key now accounts for.
 class CombinerPatternCache {
-  llvm::DenseMap<std::pair<const TargetLowering *, const llvm::DataLayout *>,
+  llvm::DenseMap<std::tuple<const TargetLowering *, const llvm::DataLayout *,
+                            const llvm::LLVMContext *>,
                  mlir::FrozenRewritePatternSet>
       Cache;
 

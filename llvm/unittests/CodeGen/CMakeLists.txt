@@ -58,4 +58,13 @@ add_llvm_unittest(CodeGenTests
 add_subdirectory(GlobalISel)
 add_subdirectory(CGPluginTest)
 
+# The CodeGenMLIR component this tests doesn't exist unless
+# LLVM_ENABLE_MLIR_ISEL is on (see llvm/lib/CodeGen/MLIR/CMakeLists.txt) --
+# guard the whole subdirectory the same way llvm/tools/CMakeLists.txt guards
+# the library itself, rather than trying to reference a nonexistent
+# component from an unconditional CMakeLists.txt.
+if (LLVM_ENABLE_MLIR_ISEL)
+  add_subdirectory(MLIR)
+endif()
+
 target_link_libraries(CodeGenTests PRIVATE LLVMTestingSupport)

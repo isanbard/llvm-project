@@ -89,13 +89,29 @@ public:
 /// dispatch case -- all need the identical "is this an exact NarrowScalar
 /// split, and if so what to split into" check before their per-op-family
 /// rewrite logic (carry-chained vs. independent-chunk vs. schoolbook mul)
-/// diverges.
-static std::optional<std::pair<LLT, unsigned>>
-getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy) {
+/// diverges. Declared in GMIRLegalizer.h (not static) so
+/// GMIRLegalizerTest.cpp can unit-test it directly -- see that
+/// declaration's comment for why.
+std::optional<std::pair<LLT, unsigned>>
+gmir::getExactNarrowScalarSplit(LegalizeActionStep Step, LLT DstTy) {
   if (Step.Action != LegalizeActions::NarrowScalar)
     return std::nullopt;
 
+  // NarrowScalar here means "split one scalar integer into N narrower
+  // scalar limbs" (the schoolbook-style algorithms below) -- it does NOT
+  // cover per-element width narrowing of a vector (e.g. <4 x s32> ->
+  // <4 x s16>), which a target's LegalizerInfo can also report as
+  // NarrowScalar. Unlike this function, the sibling FewerElements
+  // dispatch explicitly guards on Step.NewType.isVector(); bail the same
+  // way here for a vector DstTy/NarrowTy rather than silently misreading
+  // a same-element-count, narrower-per-element step as an N-way scalar
+  // limb split -- that would build a gmir.unmerge whose piece count
+  // doesn't match the source's real element count and abort in
+  // UnmergeOp::verify() instead of gracefully falling back.
   LLT NarrowTy = Step.NewType;
+  if (DstTy.isVector() || NarrowTy.isVector())
+    return std::nullopt;
+
   unsigned DstBits = DstTy.getSizeInBits();
   unsigned NarrowBits = NarrowTy.getSizeInBits();
   if (NarrowBits == 0 || DstBits % NarrowBits != 0)
@@ -252,7 +268,7 @@ public:
     LegalizeActionStep Step =
         Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
 
-    if (auto Split = getExactNarrowScalarSplit(Step, DstTy)) {
+    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
       auto [NarrowTy, NumParts] = *Split;
       MLIRContext *Context = Rewriter.getContext();
       gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
@@ -319,7 +335,7 @@ public:
     LegalizeActionStep Step =
         Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
 
-    if (auto Split = getExactNarrowScalarSplit(Step, DstTy)) {
+    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
       auto [NarrowTy, NumParts] = *Split;
       MLIRContext *Context = Rewriter.getContext();
       gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
@@ -397,7 +413,7 @@ public:
     LegalizeActionStep Step =
         Adapter.getAction(getGenericOpcode<gmir::MulOp>(), {DstTy});
 
-    if (auto Split = getExactNarrowScalarSplit(Step, DstTy)) {
+    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
       auto [NarrowTy, NumParts] = *Split;
 
       // Only the 2-limb case is implemented (see the class doc comment
