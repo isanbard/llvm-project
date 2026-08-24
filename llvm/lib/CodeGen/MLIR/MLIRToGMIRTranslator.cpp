@@ -226,6 +226,49 @@ private:
     }
   }
 
+  /// Shared body for gmir.uaddo/usubo -> G_U{ADD,SUB}O: creates the
+  /// dst/carry-out vregs, calls Build (a MachineIRBuilder buildUAddo/
+  /// buildUSubo invocation) to actually emit the instruction, then records
+  /// both results. Build is templated (rather than passed as e.g. an
+  /// ISD::Opcode and dispatched here) because buildUAddo/buildUSubo aren't
+  /// otherwise uniform enough to call generically. A plain member
+  /// function, not a macro: real breakpoint/grep targets for
+  /// UAddOOp/USubOOp instead of a shared expansion site.
+  template <typename OpTy, typename BuildFn>
+  bool translateCarryOOp(OpTy CarryOp, BuildFn Build) {
+    Register LHS = ValueToReg.lookup(CarryOp.getLhs());
+    Register RHS = ValueToReg.lookup(CarryOp.getRhs());
+    LLT DstTy = convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);
+    LLT CarryTy =
+        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);
+    Register DstReg = MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);
+    Register CarryReg =
+        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);
+    Build(DstReg, CarryReg, LHS, RHS);
+    ValueToReg[CarryOp.getDst()] = DstReg;
+    ValueToReg[CarryOp.getCarryOut()] = CarryReg;
+    return true;
+  }
+
+  /// Same shape as translateCarryOOp, for gmir.uadde/usube ->
+  /// G_U{ADD,SUB}E, which additionally thread a carry-in operand.
+  template <typename OpTy, typename BuildFn>
+  bool translateCarryEOp(OpTy CarryOp, BuildFn Build) {
+    Register LHS = ValueToReg.lookup(CarryOp.getLhs());
+    Register RHS = ValueToReg.lookup(CarryOp.getRhs());
+    Register CarryInReg = ValueToReg.lookup(CarryOp.getCarryIn());
+    LLT DstTy = convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);
+    LLT CarryTy =
+        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);
+    Register DstReg = MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);
+    Register CarryReg =
+        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);
+    Build(DstReg, CarryReg, LHS, RHS, CarryInReg);
+    ValueToReg[CarryOp.getDst()] = DstReg;
+    ValueToReg[CarryOp.getCarryOut()] = CarryReg;
+    return true;
+  }
+
   bool translateOp(Operation &Op) {
     if (auto ConstOp = dyn_cast<gmir::ConstantOp>(&Op)) {
       LLT Ty =
@@ -284,52 +327,27 @@ private:
     // standing between it and a "leave it for the legacy selector"
     // fallback, which would silently defeat the whole point of the
     // legalizer slice.
-#define GMIR_ADDSUBCARRYO_CASE(OpTy, Build)                                    \
-  if (auto CarryOp = dyn_cast<gmir::OpTy>(&Op)) {                              \
-    Register LHS = ValueToReg.lookup(CarryOp.getLhs());                        \
-    Register RHS = ValueToReg.lookup(CarryOp.getRhs());                        \
-    LLT DstTy =                                                                \
-        convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);       \
-    LLT CarryTy =                                                              \
-        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);  \
-    Register DstReg =                                                          \
-        MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);              \
-    Register CarryReg =                                                        \
-        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);            \
-    Build;                                                                     \
-    ValueToReg[CarryOp.getDst()] = DstReg;                                     \
-    ValueToReg[CarryOp.getCarryOut()] = CarryReg;                              \
-    return true;                                                               \
-  }
-    GMIR_ADDSUBCARRYO_CASE(UAddOOp,
-                           MIRBuilder.buildUAddo(DstReg, CarryReg, LHS, RHS))
-    GMIR_ADDSUBCARRYO_CASE(USubOOp,
-                           MIRBuilder.buildUSubo(DstReg, CarryReg, LHS, RHS))
-#undef GMIR_ADDSUBCARRYO_CASE
+    if (auto CarryOp = dyn_cast<gmir::UAddOOp>(&Op))
+      return translateCarryOOp(
+          CarryOp, [&](Register D, Register C, Register L, Register R) {
+            MIRBuilder.buildUAddo(D, C, L, R);
+          });
 
-#define GMIR_ADDSUBCARRYE_CASE(OpTy, Build)                                    \
-  if (auto CarryOp = dyn_cast<gmir::OpTy>(&Op)) {                              \
-    Register LHS = ValueToReg.lookup(CarryOp.getLhs());                        \
-    Register RHS = ValueToReg.lookup(CarryOp.getRhs());                        \
-    Register CarryInReg = ValueToReg.lookup(CarryOp.getCarryIn());             \
-    LLT DstTy =                                                                \
-        convertLLT(cast<gmir::LLTType>(CarryOp.getDst().getType()), DL);       \
-    LLT CarryTy =                                                              \
-        convertLLT(cast<gmir::LLTType>(CarryOp.getCarryOut().getType()), DL);  \
-    Register DstReg =                                                          \
-        MIRBuilder.getMRI()->createGenericVirtualRegister(DstTy);              \
-    Register CarryReg =                                                        \
-        MIRBuilder.getMRI()->createGenericVirtualRegister(CarryTy);            \
-    Build;                                                                     \
-    ValueToReg[CarryOp.getDst()] = DstReg;                                     \
-    ValueToReg[CarryOp.getCarryOut()] = CarryReg;                              \
-    return true;                                                               \
-  }
-    GMIR_ADDSUBCARRYE_CASE(
-        UAddEOp, MIRBuilder.buildUAdde(DstReg, CarryReg, LHS, RHS, CarryInReg))
-    GMIR_ADDSUBCARRYE_CASE(
-        USubEOp, MIRBuilder.buildUSube(DstReg, CarryReg, LHS, RHS, CarryInReg))
-#undef GMIR_ADDSUBCARRYE_CASE
+    if (auto CarryOp = dyn_cast<gmir::USubOOp>(&Op))
+      return translateCarryOOp(
+          CarryOp, [&](Register D, Register C, Register L, Register R) {
+            MIRBuilder.buildUSubo(D, C, L, R);
+          });
+
+    if (auto CarryOp = dyn_cast<gmir::UAddEOp>(&Op))
+      return translateCarryEOp(
+          CarryOp, [&](Register D, Register C, Register L, Register R,
+                       Register CI) { MIRBuilder.buildUAdde(D, C, L, R, CI); });
+
+    if (auto CarryOp = dyn_cast<gmir::USubEOp>(&Op))
+      return translateCarryEOp(
+          CarryOp, [&](Register D, Register C, Register L, Register R,
+                       Register CI) { MIRBuilder.buildUSube(D, C, L, R, CI); });
 
     if (auto Unmerge = dyn_cast<gmir::UnmergeOp>(&Op)) {
       Register SrcReg = ValueToReg.lookup(Unmerge.getSrc());

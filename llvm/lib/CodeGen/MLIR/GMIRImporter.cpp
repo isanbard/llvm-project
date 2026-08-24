@@ -385,6 +385,19 @@ bool FunctionImporter::importBinaryOp(BinaryOperator &BinOp) {
   return true;
 }
 
+/// Imports BB's non-PHI instructions in order (PHIs are handled separately
+/// in pass 1, before any block body is visited, since a PHI's operands can
+/// come from not-yet-imported successor blocks). Dispatches each
+/// instruction to its own import* method by dynamic type; a terminator
+/// (return/br) ends the block and returns directly, while every other
+/// successfully-imported instruction `continue`s to the next one. Central
+/// scope boundary for this whole importer: any instruction kind with no
+/// case here (or whose own import* method declines, e.g. a vector GEP)
+/// falls all the way through to the final `return false` below, which
+/// bails the whole function back to the legacy selector rather than
+/// mistranslate -- the same graceful-fallback discipline every import*
+/// method already uses internally, just applied at the dispatch level for
+/// constructs this milestone slice doesn't model at all yet.
 bool FunctionImporter::importBlockBody(BasicBlock &BB) {
   for (Instruction &I : BB) {
     if (isa<PHINode>(I))
