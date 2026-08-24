@@ -211,6 +211,43 @@ static bool rewriteFewerElements(OpTy Op, PatternRewriter &Rewriter,
   return true;
 }
 
+/// Shared dispatch scaffold for AddSubLegalizePattern/BitwiseLegalizePattern/
+/// MulLegalizePattern's matchAndRewrite: queries Adapter.getAction exactly
+/// once, then dispatches on the result. NarrowScalar goes to the
+/// caller-supplied per-op-family NarrowBody -- the only part that
+/// genuinely differs between the three (carry-chained add/sub,
+/// independent-chunk bitwise, or schoolbook mul); WidenScalar/
+/// FewerElements are identical across all three and already fully shared
+/// via rewriteWidenScalar/rewriteFewerElements above. NarrowBody returns
+/// its own LogicalResult (not just whether it fired) so a family that
+/// recognizes the split but can't handle its specific shape
+/// (MulLegalizePattern's NumParts!=2 bail) can still commit to failure()
+/// without falling through to try WidenScalar/FewerElements afterward --
+/// matching every family's original control flow exactly.
+template <typename OpTy, typename NarrowBodyFn>
+static LogicalResult
+dispatchLegalizeAction(OpTy Op, PatternRewriter &Rewriter,
+                       const GMIRLegalizerInfoAdapter &Adapter,
+                       const llvm::DataLayout &DL, NarrowBodyFn NarrowBody) {
+  auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+  LLT DstTy = gmir::convertLLT(DstGTy, DL);
+  LegalizeActionStep Step =
+      Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
+
+  if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy))
+    return NarrowBody(Op, Rewriter, DstGTy, Split->first, Split->second);
+
+  if (Step.Action == LegalizeActions::WidenScalar) {
+    rewriteWidenScalar(Op, Rewriter, Step.NewType);
+    return success();
+  }
+
+  if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+    return success();
+
+  return failure();
+}
+
 namespace {
 
 /// Shared constructor/member boilerplate for every gmir-level
@@ -263,52 +300,40 @@ public:
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
-    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
-    LLT DstTy = gmir::convertLLT(DstGTy, DL);
-    LegalizeActionStep Step =
-        Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
+    return dispatchLegalizeAction(
+        Op, Rewriter, Adapter, DL,
+        [](OpTy Op, PatternRewriter &Rewriter, gmir::LLTType DstGTy,
+           LLT NarrowTy, unsigned NumParts) -> LogicalResult {
+          MLIRContext *Context = Rewriter.getContext();
+          gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+          gmir::LLTType CarryGTy =
+              gmir::convertToGMIRType(*Context, LLT::integer(1));
 
-    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
-      auto [NarrowTy, NumParts] = *Split;
-      MLIRContext *Context = Rewriter.getContext();
-      gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
-      gmir::LLTType CarryGTy =
-          gmir::convertToGMIRType(*Context, LLT::integer(1));
+          Location Loc = Op.getLoc();
+          auto [LhsParts, RhsParts] =
+              unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
 
-      Location Loc = Op.getLoc();
-      auto [LhsParts, RhsParts] =
-          unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
+          SmallVector<mlir::Value, 4> DstParts;
+          mlir::Value CarryIn;
+          for (unsigned I = 0; I != NumParts; ++I) {
+            mlir::Value L = LhsParts.getDsts()[I];
+            mlir::Value R = RhsParts.getDsts()[I];
+            if (I == 0) {
+              auto C =
+                  CarryOOp::create(Rewriter, Loc, NarrowGTy, CarryGTy, L, R);
+              DstParts.push_back(C.getDst());
+              CarryIn = C.getCarryOut();
+            } else {
+              auto C = CarryEOp::create(Rewriter, Loc, NarrowGTy, CarryGTy, L,
+                                        R, CarryIn);
+              DstParts.push_back(C.getDst());
+              CarryIn = C.getCarryOut();
+            }
+          }
 
-      SmallVector<mlir::Value, 4> DstParts;
-      mlir::Value CarryIn;
-      for (unsigned I = 0; I != NumParts; ++I) {
-        mlir::Value L = LhsParts.getDsts()[I];
-        mlir::Value R = RhsParts.getDsts()[I];
-        if (I == 0) {
-          auto C = CarryOOp::create(Rewriter, Loc, NarrowGTy, CarryGTy, L, R);
-          DstParts.push_back(C.getDst());
-          CarryIn = C.getCarryOut();
-        } else {
-          auto C = CarryEOp::create(Rewriter, Loc, NarrowGTy, CarryGTy, L, R,
-                                    CarryIn);
-          DstParts.push_back(C.getDst());
-          CarryIn = C.getCarryOut();
-        }
-      }
-
-      Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
-      return success();
-    }
-
-    if (Step.Action == LegalizeActions::WidenScalar) {
-      rewriteWidenScalar(Op, Rewriter, Step.NewType);
-      return success();
-    }
-
-    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
-      return success();
-
-    return failure();
+          Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+          return success();
+        });
   }
 };
 
@@ -330,40 +355,28 @@ public:
 
   LogicalResult matchAndRewrite(OpTy Op,
                                 PatternRewriter &Rewriter) const override {
-    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
-    LLT DstTy = gmir::convertLLT(DstGTy, DL);
-    LegalizeActionStep Step =
-        Adapter.getAction(getGenericOpcode<OpTy>(), {DstTy});
+    return dispatchLegalizeAction(
+        Op, Rewriter, Adapter, DL,
+        [](OpTy Op, PatternRewriter &Rewriter, gmir::LLTType DstGTy,
+           LLT NarrowTy, unsigned NumParts) -> LogicalResult {
+          MLIRContext *Context = Rewriter.getContext();
+          gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
 
-    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
-      auto [NarrowTy, NumParts] = *Split;
-      MLIRContext *Context = Rewriter.getContext();
-      gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+          Location Loc = Op.getLoc();
+          auto [LhsParts, RhsParts] =
+              unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
 
-      Location Loc = Op.getLoc();
-      auto [LhsParts, RhsParts] =
-          unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
+          SmallVector<mlir::Value, 4> DstParts;
+          for (unsigned I = 0; I != NumParts; ++I) {
+            auto Chunk =
+                OpTy::create(Rewriter, Loc, NarrowGTy, LhsParts.getDsts()[I],
+                             RhsParts.getDsts()[I]);
+            DstParts.push_back(Chunk.getResult());
+          }
 
-      SmallVector<mlir::Value, 4> DstParts;
-      for (unsigned I = 0; I != NumParts; ++I) {
-        auto Chunk = OpTy::create(Rewriter, Loc, NarrowGTy,
-                                  LhsParts.getDsts()[I], RhsParts.getDsts()[I]);
-        DstParts.push_back(Chunk.getResult());
-      }
-
-      Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
-      return success();
-    }
-
-    if (Step.Action == LegalizeActions::WidenScalar) {
-      rewriteWidenScalar(Op, Rewriter, Step.NewType);
-      return success();
-    }
-
-    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
-      return success();
-
-    return failure();
+          Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+          return success();
+        });
   }
 };
 
@@ -408,56 +421,43 @@ public:
 
   LogicalResult matchAndRewrite(gmir::MulOp Op,
                                 PatternRewriter &Rewriter) const override {
-    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
-    LLT DstTy = gmir::convertLLT(DstGTy, DL);
-    LegalizeActionStep Step =
-        Adapter.getAction(getGenericOpcode<gmir::MulOp>(), {DstTy});
+    return dispatchLegalizeAction(
+        Op, Rewriter, Adapter, DL,
+        [](gmir::MulOp Op, PatternRewriter &Rewriter, gmir::LLTType DstGTy,
+           LLT NarrowTy, unsigned NumParts) -> LogicalResult {
+          // Only the 2-limb case is implemented (see the class doc
+          // comment for why NumParts other than 2 is a real, if
+          // so-far-unobserved, possibility rather than something the
+          // importer's type cap rules out) -- bail explicitly rather
+          // than mishandle it, same fail-closed-to-the-real-downstream-
+          // Legalizer discipline as every other unhandled case in this
+          // file.
+          if (NumParts != 2)
+            return failure();
 
-    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
-      auto [NarrowTy, NumParts] = *Split;
+          MLIRContext *Context = Rewriter.getContext();
+          gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+          Location Loc = Op.getLoc();
+          auto [LhsParts, RhsParts] =
+              unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
+          mlir::Value ALo = LhsParts.getDsts()[0];
+          mlir::Value AHi = LhsParts.getDsts()[1];
+          mlir::Value BLo = RhsParts.getDsts()[0];
+          mlir::Value BHi = RhsParts.getDsts()[1];
 
-      // Only the 2-limb case is implemented (see the class doc comment
-      // for why NumParts other than 2 is a real, if so-far-unobserved,
-      // possibility rather than something the importer's type cap rules
-      // out) -- bail explicitly rather than mishandle it, same
-      // fail-closed-to-the-real-downstream-Legalizer discipline as every
-      // other unhandled case in this file.
-      if (NumParts != 2)
-        return failure();
+          auto Lo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+          auto HiHi = gmir::UMulHOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+          auto LoHi = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BHi);
+          auto HiLo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, AHi, BLo);
+          auto Hi0 = gmir::AddOp::create(Rewriter, Loc, NarrowGTy,
+                                         HiHi.getResult(), LoHi.getResult());
+          auto Hi = gmir::AddOp::create(Rewriter, Loc, NarrowGTy,
+                                        Hi0.getResult(), HiLo.getResult());
 
-      MLIRContext *Context = Rewriter.getContext();
-      gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
-      Location Loc = Op.getLoc();
-      auto [LhsParts, RhsParts] =
-          unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
-      mlir::Value ALo = LhsParts.getDsts()[0];
-      mlir::Value AHi = LhsParts.getDsts()[1];
-      mlir::Value BLo = RhsParts.getDsts()[0];
-      mlir::Value BHi = RhsParts.getDsts()[1];
-
-      auto Lo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
-      auto HiHi = gmir::UMulHOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
-      auto LoHi = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BHi);
-      auto HiLo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, AHi, BLo);
-      auto Hi0 = gmir::AddOp::create(Rewriter, Loc, NarrowGTy, HiHi.getResult(),
-                                     LoHi.getResult());
-      auto Hi = gmir::AddOp::create(Rewriter, Loc, NarrowGTy, Hi0.getResult(),
-                                    HiLo.getResult());
-
-      SmallVector<mlir::Value, 2> DstParts{Lo.getResult(), Hi.getResult()};
-      Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
-      return success();
-    }
-
-    if (Step.Action == LegalizeActions::WidenScalar) {
-      rewriteWidenScalar(Op, Rewriter, Step.NewType);
-      return success();
-    }
-
-    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
-      return success();
-
-    return failure();
+          SmallVector<mlir::Value, 2> DstParts{Lo.getResult(), Hi.getResult()};
+          Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+          return success();
+        });
   }
 };
 

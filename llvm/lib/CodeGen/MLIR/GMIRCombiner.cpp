@@ -95,6 +95,44 @@ static std::optional<mlir::Value> matchRepeatedOperand(OpTy Op,
   return std::nullopt;
 }
 
+// Generalizes matchRepeatedOperand above to an outer op and an
+// independently-typed inner op (matchRepeatedOperand's OuterOpTy and
+// InnerOpTy are always the same type) -- shared by XorAndDeMorganPattern
+// (Outer=XorOp, Inner=AndOp) and ICmpBinOpEqOtherPattern (Outer=ICmpOp,
+// Inner=AddOp/SubOp/XorOp), which both need this same "for each of Op's
+// two operands, check if it's InnerOpTy and if Op's *other* operand
+// equals one of Inner's own two operands" search, plus (unlike
+// matchRepeatedOperand's callers) the outer op's *other* operand itself,
+// to build their replacement. Returns {Inner, Other, Matched} on success,
+// where Matched is whichever of Inner's own operands Other didn't equal
+// (i.e. what Other "cancels out" against). IsCommutative controls
+// whether Inner.getRhs() is even checked as a candidate for Other -- must
+// be false for a non-commutative InnerOpTy like gmir.sub, where matching
+// that side would silently accept a different (and, for
+// ICmpBinOpEqOtherPattern's sub case, deliberately unimplemented)
+// identity. Gate lets a caller reject an otherwise-matching Inner for a
+// structural reason beyond operand equality (XorAndDeMorganPattern's
+// hasOneUse() profitability check); pass a callback that always returns
+// true if no such check is needed.
+template <typename InnerOpTy, typename OuterOpTy, typename GateTy>
+static std::optional<std::tuple<InnerOpTy, mlir::Value, mlir::Value>>
+matchOuterInnerPair(OuterOpTy Op, bool IsCommutative, GateTy Gate) {
+  for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+    auto Inner = Cand.getDefiningOp<InnerOpTy>();
+    if (!Inner || !Gate(Inner))
+      continue;
+
+    mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+    if (Other == Inner.getLhs())
+      return std::make_tuple(Inner, Other, Inner.getRhs());
+
+    if (IsCommutative && Other == Inner.getRhs())
+      return std::make_tuple(Inner, Other, Inner.getLhs());
+  }
+
+  return std::nullopt;
+}
+
 // Shared by every icmp pattern in this slice -- TargetLowering.cpp:5722's
 // SETEQ/SETNE gate (re-verified to also gate candidates 2-7 individually
 // at their own call sites, TargetLowering.cpp:5724-5773). Checks against
@@ -189,46 +227,37 @@ public:
 /// dual-order check in this pipeline, so this pattern deliberately
 /// generalizes to all 4 combinations (both gmir.xor operand orders x
 /// both gmir.and operand orders) rather than literally porting the
-/// single shape DAGCombiner happens to check. Doesn't reuse
-/// matchRepeatedOperand<OpTy> (unlike XorSelfCancelPattern above): that
-/// helper's Inner and Outer op are the same OpTy by construction, but
-/// here Outer is XorOp and Inner is AndOp -- a genuinely different,
-/// two-op-type shape, not worth generalizing the helper for in this
-/// slice.
+/// single shape DAGCombiner happens to check. Shares its search skeleton
+/// with ICmpBinOpEqOtherPattern below via matchOuterInnerPair (Outer=
+/// XorOp, Inner=AndOp here) -- both need the identical "for each of Op's
+/// two operands, check InnerOpTy, check Op's other operand against
+/// Inner's own operands" shape, unlike matchRepeatedOperand's
+/// same-outer/inner-type callers above.
 class XorAndDeMorganPattern : public OpRewritePattern<gmir::XorOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
 
   LogicalResult matchAndRewrite(gmir::XorOp Op,
                                 PatternRewriter &Rewriter) const override {
-    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
-      auto And = Cand.getDefiningOp<gmir::AndOp>();
-      if (!And || !And.getResult().hasOneUse())
-        continue;
+    auto Match = matchOuterInnerPair<gmir::AndOp>(
+        Op, /*IsCommutative=*/true,
+        [](gmir::AndOp And) { return And.getResult().hasOneUse(); });
+    if (!Match)
+      return failure();
+    auto [And, Other, X] = *Match;
+    (void)And;
 
-      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
-      mlir::Value X;
-      if (Other == And.getRhs())
-        X = And.getLhs();
-      else if (Other == And.getLhs())
-        X = And.getRhs();
-      else
-        continue;
-
-      auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
-      unsigned Width = DstGTy.getScalarSizeInBits();
-      Location Loc = Op.getLoc();
-      IntegerAttr NegOneAttr =
-          makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
-      auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
-      auto NotX =
-          gmir::XorOp::create(Rewriter, Loc, DstGTy, X, NegOne.getResult());
-      Rewriter.replaceOpWithNewOp<gmir::AndOp>(Op, DstGTy, NotX.getResult(),
-                                               Other);
-      return success();
-    }
-
-    return failure();
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    unsigned Width = DstGTy.getScalarSizeInBits();
+    Location Loc = Op.getLoc();
+    IntegerAttr NegOneAttr =
+        makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
+    auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
+    auto NotX =
+        gmir::XorOp::create(Rewriter, Loc, DstGTy, X, NegOne.getResult());
+    Rewriter.replaceOpWithNewOp<gmir::AndOp>(Op, DstGTy, NotX.getResult(),
+                                             Other);
+    return success();
   }
 };
 
@@ -486,7 +515,11 @@ public:
 /// induction-variable-chain analysis to replicate. This pattern
 /// deliberately ports only the sound core identity, applied symmetrically
 /// to both icmp operand positions, matching this slice's Tier-1/
-/// unconditional scope.
+/// unconditional scope. Shares its search skeleton with
+/// XorAndDeMorganPattern above via matchOuterInnerPair (Outer=ICmpOp,
+/// Inner=OpTy here); IsCommutative=false for OpTy=SubOp is what excludes
+/// the Y==N1 shape for sub (matchOuterInnerPair's "Matched" side ==
+/// Inner.getLhs() only, never Inner.getRhs(), when not commutative).
 template <typename OpTy>
 class ICmpBinOpEqOtherPattern : public OpRewritePattern<gmir::ICmpOp> {
 public:
@@ -497,34 +530,23 @@ public:
     if (!isEqualityPredicate(Op.getPredicateAttr().getValue().getSExtValue()))
       return failure();
 
-    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
-      auto BinOp = Cand.getDefiningOp<OpTy>();
-      if (!BinOp)
-        continue;
+    auto Match = matchOuterInnerPair<OpTy>(
+        Op, /*IsCommutative=*/!std::is_same_v<OpTy, gmir::SubOp>,
+        [](OpTy) { return true; });
+    if (!Match)
+      return failure();
+    auto [BinOp, Other, Remaining] = *Match;
+    (void)Other;
 
-      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
-      mlir::Value Remaining;
-      if (BinOp.getLhs() == Other)
-        Remaining = BinOp.getRhs();
-      else if constexpr (!std::is_same_v<OpTy, gmir::SubOp>)
-        if (BinOp.getRhs() == Other)
-          Remaining = BinOp.getLhs();
-
-      if (!Remaining)
-        continue;
-
-      auto DstGTy = cast<gmir::LLTType>(BinOp.getResult().getType());
-      IntegerAttr ZeroAttr = makeGMIRConstAttr(
-          Rewriter.getContext(), APInt::getZero(DstGTy.getScalarSizeInBits()));
-      auto Zero =
-          gmir::ConstantOp::create(Rewriter, Op.getLoc(), DstGTy, ZeroAttr);
-      Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(Op, Op.getResult().getType(),
-                                                Op.getPredicateAttr(),
-                                                Remaining, Zero.getResult());
-      return success();
-    }
-
-    return failure();
+    auto DstGTy = cast<gmir::LLTType>(BinOp.getResult().getType());
+    IntegerAttr ZeroAttr = makeGMIRConstAttr(
+        Rewriter.getContext(), APInt::getZero(DstGTy.getScalarSizeInBits()));
+    auto Zero =
+        gmir::ConstantOp::create(Rewriter, Op.getLoc(), DstGTy, ZeroAttr);
+    Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(Op, Op.getResult().getType(),
+                                              Op.getPredicateAttr(), Remaining,
+                                              Zero.getResult());
+    return success();
   }
 };
 
