@@ -21,6 +21,7 @@ mlir_tablegen(IR/GMIRDialectOps.cpp.inc -gen-op-defs)
 add_public_tablegen_target(MLIRGMIRDialectIncGen)
 
 add_llvm_component_library(LLVMCodeGenMLIR
+  GMIRCombiner.cpp
   GMIRImporter.cpp
   GMIRLegalizer.cpp
   IR/GMIRDialect.cpp

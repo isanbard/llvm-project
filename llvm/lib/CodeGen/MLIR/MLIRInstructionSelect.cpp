@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "GMIRCombiner.h"
 #include "GMIRImporter.h"
 #include "GMIRLegalizer.h"
 #include "IR/GMIRDialect.h"
@@ -52,6 +53,17 @@ using namespace llvm;
 static cl::opt<bool> PrintGMIRAfterLegalize(
     "print-gmir-after-legalize", cl::Hidden,
     cl::desc("Print the gmir IR right after GMIRLegalizer runs, before "
+             "MLIRToGMIRTranslator lowers it to real MIR"));
+
+// Same rationale as PrintGMIRAfterLegalize above, for the combiner: on
+// AArch64 (unlike X86 at this opt level), a real downstream GICombiner
+// pass runs even at the -O0-equivalent opt level GMIRCombiner itself
+// targets, so the usual -global-isel asm-diff oracle can't by itself
+// distinguish "GMIRCombiner's own fold()/CSE ran" from "the safety-net
+// combiner quietly did the work instead" -- see GMIRCombiner.h.
+static cl::opt<bool> PrintGMIRAfterCombine(
+    "print-gmir-after-combine", cl::Hidden,
+    cl::desc("Print the gmir IR right after GMIRCombiner runs, before "
              "MLIRToGMIRTranslator lowers it to real MIR"));
 
 namespace {
@@ -131,10 +143,20 @@ public:
       llvm::errs() << '\n';
     }
 
-    // Everything below is only needed once import/legalization succeeded
-    // -- fetched here, after that check, rather than unconditionally up
-    // front, so a function outside the supported subset (the common case
-    // for real-world code today) doesn't pay for an unused BPI lookup, a
+    if (!gmir::combine(FuncOp, CombinerCache)) {
+      MF.getProperties().setFailedISel();
+      return false;
+    }
+
+    if (PrintGMIRAfterCombine) {
+      FuncOp.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+
+    // Everything below is only needed once import/legalization/combining
+    // succeeded -- fetched here, after that check, rather than unconditionally
+    // up front, so a function outside the supported subset (the common case for
+    // real-world code today) doesn't pay for an unused BPI lookup, a
     // TargetPassConfig analysis fetch, a CSE-config query, and
     // createMIRBuilder's allocation before falling back.
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
@@ -170,6 +192,7 @@ public:
 private:
   mlir::MLIRContext Context;
   gmir::LegalizerPatternCache PatternCache;
+  gmir::CombinerPatternCache CombinerCache;
 };
 } // namespace
 
