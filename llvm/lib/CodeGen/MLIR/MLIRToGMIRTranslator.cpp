@@ -13,7 +13,6 @@
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/GlobalISel/CallLowering.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
-#include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
@@ -309,6 +308,23 @@ private:
       return true;
     }
 
+    if (auto PtrAdd = dyn_cast<gmir::PtrAddOp>(&Op)) {
+      Register PtrReg = ValueToReg.lookup(PtrAdd.getPtr());
+      Register OffReg = ValueToReg.lookup(PtrAdd.getOffset());
+      LLT Ty =
+          convertLLT(cast<gmir::LLTType>(PtrAdd.getResult().getType()), DL);
+      unsigned Flags = 0;
+      if (PtrAdd.getNoUWrap())
+        Flags |= MachineInstr::MIFlag::NoUWrap;
+      if (PtrAdd.getNoUSWrap())
+        Flags |= MachineInstr::MIFlag::NoUSWrap;
+      if (PtrAdd.getInBounds())
+        Flags |= MachineInstr::MIFlag::InBounds;
+      auto MIB = MIRBuilder.buildPtrAdd(Ty, PtrReg, OffReg, Flags);
+      ValueToReg[PtrAdd.getResult()] = MIB.getReg(0);
+      return true;
+    }
+
     // GMIRImporter only ever emits the ops handled above (plus
     // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
     return false;
@@ -352,7 +368,8 @@ private:
 } // namespace
 
 bool gmir::translate(mlir::func::FuncOp FuncOp, Function &F,
-                     MachineFunction &MF, const BranchProbabilityInfo &BPI) {
+                     MachineFunction &MF, const BranchProbabilityInfo &BPI,
+                     MachineIRBuilder &MIRBuilder) {
   const CallLowering *CLI = MF.getSubtarget().getCallLowering();
   // getCallLowering() defaults to nullptr (TargetSubtargetInfo's base
   // implementation) and isn't overridden by every in-tree target (e.g.
@@ -373,11 +390,5 @@ bool gmir::translate(mlir::func::FuncOp FuncOp, Function &F,
   FuncInfo.BPI = nullptr;
   FuncInfo.CanLowerReturn = CLI->checkReturnTypeForCallConv(MF);
 
-  // CSE isn't enabled yet -- see createMIRBuilder's doc comment; this
-  // translator switches it on once it has a reassociation-sensitive
-  // consumer that benefits from it.
-  std::unique_ptr<MachineIRBuilder> MIRBuilder =
-      createMIRBuilder(MF, /*CSEInfo=*/nullptr);
-
-  return GMIRToMIRWalker(MF, *MIRBuilder, *CLI, BPI).run(FuncOp, F, FuncInfo);
+  return GMIRToMIRWalker(MF, MIRBuilder, *CLI, BPI).run(FuncOp, F, FuncInfo);
 }

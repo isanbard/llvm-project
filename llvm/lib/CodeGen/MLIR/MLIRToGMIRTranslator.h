@@ -23,6 +23,7 @@ namespace llvm {
 class BranchProbabilityInfo;
 class Function;
 class MachineFunction;
+class MachineIRBuilder;
 
 namespace gmir {
 
@@ -33,12 +34,20 @@ namespace gmir {
 /// gmir.br/gmir.brcond's successors (mirrors IRTranslator's
 /// addSuccessorWithProb) so downstream passes like MachineBlockPlacement
 /// make the same layout/alignment decisions (e.g. loop-header alignment)
-/// GlobalISel's own pipeline would. Returns false if the target has no
-/// CallLowering implementation, or CallLowering itself declines -- the
-/// caller should treat that the same as an unsupported import: fall back
-/// gracefully.
+/// GlobalISel's own pipeline would. MIRBuilder is caller-owned (already
+/// MF-bound) rather than constructed here so the caller can choose a
+/// CSE-enabled builder to match IRTranslator::translate's own choice: a
+/// plain MachineIRBuilder measurably changes downstream GlobalISel
+/// combiner passes' reassociation matching (reused unchanged from the
+/// real pipeline), since their rules depend on structurally-clean,
+/// deduplicated input the way IRTranslator always produces it -- e.g. a
+/// multi-index GEP's constant-offset gmir.ptr_add chain selected a
+/// different (but semantically equivalent) AArch64 addressing mode
+/// without this. Returns false if the target has no CallLowering
+/// implementation, or CallLowering itself declines -- the caller should
+/// treat that the same as an unsupported import: fall back gracefully.
 bool translate(mlir::func::FuncOp FuncOp, Function &F, MachineFunction &MF,
-               const BranchProbabilityInfo &BPI);
+               const BranchProbabilityInfo &BPI, MachineIRBuilder &MIRBuilder);
 
 } // namespace gmir
 } // namespace llvm

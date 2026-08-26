@@ -28,6 +28,7 @@
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/CodeGen/GlobalISel/CSEInfo.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/CodeGen/MLIRISel.h"
@@ -93,7 +94,21 @@ public:
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
     mlir::func::FuncOp FuncOp = gmir::importFunction(*Module, MF.getFunction());
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
-    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI)) {
+
+    // Match IRTranslatorLegacy::runOnMachineFunction's own choice of
+    // builder exactly (see MLIRToGMIRTranslator.h's translate() doc
+    // comment for why a plain MachineIRBuilder isn't just a style
+    // difference here): CSE is on unconditionally here, the same default
+    // IRTranslator itself uses now that TargetPassConfig no longer
+    // exposes a CSE-enabled query of its own.
+    auto &TPC = getAnalysis<TargetPassConfig>();
+    GISelCSEAnalysisWrapper &Wrapper =
+        getAnalysis<GISelCSEAnalysisWrapperPass>().getCSEWrapper();
+    GISelCSEInfo *CSEInfo = &Wrapper.get(TPC.getCSEConfig());
+    std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
+
+    if (!FuncOp ||
+        !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
       // Outside the currently-supported subset, or CallLowering itself
       // declined: defer to the existing selector, same as always.
       MF.getProperties().setFailedISel();

@@ -12,8 +12,11 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Operator.h"
+#include "llvm/Support/MathExtras.h"
 #include <limits>
 #include <optional>
 
@@ -31,9 +34,13 @@ using namespace llvm;
 /// also correctly rejects non-constant wide-integer values (e.g. two real
 /// i128 arguments added together), which nothing downstream validates
 /// either. Note: both `Value` and `Type` name distinct classes in ::llvm
-/// and ::mlir, so this file explicitly qualifies mlir::Value/mlir::Type/
-/// mlir::FunctionType throughout to avoid ambiguous lookups under the
-/// blanket `using namespace llvm;`/`using namespace mlir;` below.
+/// and ::mlir, so this file explicitly qualifies every mlir:: type/call
+/// instead of also pulling in `using namespace mlir;` alongside `using
+/// namespace llvm;` below -- this file implements code in ::llvm, not
+/// ::mlir, so only the former is the standard-sanctioned exception to
+/// LLVM's "don't `using namespace`" rule (see CodingStandards.md); the
+/// latter would just be inviting exactly this Value/Type-style
+/// collision instead of avoiding it.
 static gmir::LLTType convertType(mlir::MLIRContext &Context, llvm::Type *Ty) {
   if (auto *IntTy = dyn_cast<llvm::IntegerType>(Ty)) {
     if (IntTy->getBitWidth() > 64)
@@ -55,7 +62,13 @@ static gmir::LLTType convertType(mlir::MLIRContext &Context, llvm::Type *Ty) {
 // size needs this: gmir.alloca's size attribute is stored as an int64_t,
 // so a uint64_t byte count at or above 2^63 (which doesn't overflow the
 // uint64_t arraySize*elementSize product computed to get there) would
-// otherwise silently become a negative size.
+// otherwise silently become a negative size. importGEP's offset
+// accumulation below needs the same guard: casting an out-of-range
+// uint64_t field/element offset straight into the int64_t
+// AddOverflow/MulOverflow calls below would corrupt the value *before*
+// those calls ever run, defeating the overflow check they're there to
+// provide -- the check must see the original, correctly-signed
+// magnitude, not a value already mangled by an unchecked narrowing cast.
 static std::optional<int64_t> checkedU64ToI64(uint64_t V) {
   if (V > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
     return std::nullopt;
@@ -227,8 +240,13 @@ private:
           return false;
         continue;
       }
-      // Anything else (calls, GEPs, switches, casts, selects, ...) is out
-      // of scope for now -- fall back rather than mistranslate. Note:
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        if (!importGEP(*GEP))
+          return false;
+        continue;
+      }
+      // Anything else (calls, switches, casts, selects, ...) is out of
+      // scope for now -- fall back rather than mistranslate. Note:
       // `select` and `switch` are reachable even from simple hand-written
       // diamond/chained-if IR, since llc's own IR-level pipeline
       // (CodeGenPrepare/SimplifyCFG-style passes) canonicalizes some
@@ -409,6 +427,158 @@ private:
         Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
         SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
         IsNonTemporal);
+    return true;
+  }
+
+  /// Imports a scalar/pointer-only GetElementPtrInst, porting
+  /// IRTranslator::translateGetElementPtr's constant-index-coalescing
+  /// algorithm exactly (for -global-isel byte parity on multi-index GEPs,
+  /// rather than a naive one-ptr_add-per-index scheme): runs of constant
+  /// struct-field/array indices accumulate into a single running offset,
+  /// flushed into one gmir.constant+gmir.ptr_add only when a variable
+  /// index is hit and (if still nonzero) once more at the end; each
+  /// variable index gets its own gmir.mul (skipped when the element size
+  /// is 1) + gmir.ptr_add. Bails (falls back to the legacy selector) for:
+  /// vector GEPs (result or pointer-operand type isa<VectorType> --
+  /// catches scalable vectors too, since ScalableVectorType inherits
+  /// VectorType); a variable index whose integer bit width doesn't match
+  /// the pointer-index type's width, since gmir has no sext/trunc op yet
+  /// to fix that up (see gmir.ptr_add's doc comment); and int64_t overflow
+  /// while accumulating the constant offset (a plain += could wrap for a
+  /// pathological but constructible GEP chain, e.g. deeply nested/huge
+  /// structs, producing a wrong, in-bounds-looking offset instead of
+  /// failing closed -- same bug class as importAlloca's overflow guard).
+  bool importGEP(GetElementPtrInst &GEP) {
+    // llvm::VectorType vs. mlir::VectorType collide under this file's
+    // blanket `using namespace llvm;`/`using namespace mlir;` -- same
+    // class of ambiguity as Value/Type/Attribute/DenseMap noted elsewhere
+    // in this codebase; explicit `llvm::` qualification required.
+    if (isa<llvm::VectorType>(GEP.getType()) ||
+        isa<llvm::VectorType>(GEP.getPointerOperandType()))
+      return false;
+
+    mlir::Value BaseVal;
+    if (!getOperand(GEP.getPointerOperand(), BaseVal))
+      return false;
+
+    auto &GEPOp = cast<GEPOperator>(GEP);
+    if (GEPOp.hasAllZeroIndices()) {
+      ValueMap[&GEP] = BaseVal;
+      return true;
+    }
+
+    gmir::LLTType PtrTy = convertType(Context, GEP.getType());
+    if (!PtrTy)
+      return false;
+
+    llvm::Type *OffsetIRTy = DL->getIndexType(GEP.getPointerOperandType());
+    unsigned IndexBitWidth = OffsetIRTy->getIntegerBitWidth();
+    // Unlike PtrTy (pointers always convert successfully -- convertType has
+    // no width restriction for them), the pointer's index type is an
+    // *integer* whose width is datalayout-defined, not statically bounded,
+    // so it can hit convertType's >64-bit rejection on an unusual custom
+    // datalayout (e.g. `p:128:128`). Bail like every other convertType-
+    // consuming path in this file, rather than handing a null type to gmir
+    // op construction below.
+    gmir::LLTType OffsetTy = convertType(Context, OffsetIRTy);
+    if (!OffsetTy)
+      return false;
+
+    bool NoUWrap = GEPOp.hasNoUnsignedWrap();
+    bool NoUSWrap = GEPOp.hasNoUnsignedSignedWrap();
+    bool InBounds = GEPOp.isInBounds();
+
+    // A nonnegative constant offset added on top of a nusw/inbounds
+    // pointer can't unsigned-wrap either -- IRTranslator.cpp's
+    // PtrAddFlagsWithConst upgrade, applied only at constant-offset flush
+    // points below, not the variable-index gmir.ptr_add further down.
+    auto EmitConstOffset = [&](int64_t Offset) {
+      auto ConstOp =
+          gmir::ConstantOp::create(Builder, Builder.getUnknownLoc(), OffsetTy,
+                                   Builder.getI64IntegerAttr(Offset));
+      bool UpgradedNoUWrap = NoUWrap || (NoUSWrap && Offset >= 0);
+      auto AddOp = gmir::PtrAddOp::create(
+          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal, ConstOp.getResult(),
+          UpgradedNoUWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          NoUSWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          InBounds ? Builder.getUnitAttr() : mlir::UnitAttr());
+      BaseVal = AddOp.getResult();
+    };
+
+    int64_t Offset = 0;
+    for (auto GTI = gep_type_begin(GEP), GTE = gep_type_end(GEP); GTI != GTE;
+         ++GTI) {
+      llvm::Value *Idx = GTI.getOperand();
+      if (llvm::StructType *StTy = GTI.getStructTypeOrNull()) {
+        unsigned Field = cast<Constant>(Idx)->getUniqueInteger().getZExtValue();
+        uint64_t FieldOff = DL->getStructLayout(StTy)->getElementOffset(Field);
+        auto SignedFieldOff = checkedU64ToI64(FieldOff);
+        if (!SignedFieldOff || AddOverflow(Offset, *SignedFieldOff, Offset))
+          return false;
+        continue;
+      }
+      // getSequentialElementStride returns a TypeSize; a scalable stride
+      // (e.g. this step indexes into a <vscale x N x T> element) would
+      // fatally abort the compiler on an implicit conversion to uint64_t
+      // rather than falling back gracefully -- same class of gap as
+      // computeGMIRLeafTypes's array-element case.
+      TypeSize ElementSizeTS = GTI.getSequentialElementStride(*DL);
+      if (ElementSizeTS.isScalable())
+        return false;
+      uint64_t ElementSize = ElementSizeTS.getFixedValue();
+      if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+        if (auto Val = CI->getValue().trySExtValue()) {
+          // A large constant array index times a large element size can
+          // overflow the product, and/or overflow Offset when added in --
+          // same overflow concern as the struct-offset case above.
+          auto SignedElementSize = checkedU64ToI64(ElementSize);
+          int64_t Prod;
+          if (!SignedElementSize ||
+              MulOverflow(*SignedElementSize, *Val, Prod) ||
+              AddOverflow(Offset, Prod, Offset))
+            return false;
+          continue;
+        }
+      }
+
+      // Variable index: flush any accumulated constant offset first, then
+      // emit Idx * ElementSize (if needed) + a ptr_add for Idx itself.
+      if (Idx->getType()->getIntegerBitWidth() != IndexBitWidth)
+        return false;
+      if (Offset != 0) {
+        EmitConstOffset(Offset);
+        Offset = 0;
+      }
+
+      mlir::Value IdxVal;
+      if (!getOperand(Idx, IdxVal))
+        return false;
+
+      mlir::Value ScaledVal = IdxVal;
+      if (ElementSize != 1) {
+        auto ElemSizeConst = gmir::ConstantOp::create(
+            Builder, Builder.getUnknownLoc(), OffsetTy,
+            Builder.getI64IntegerAttr(static_cast<int64_t>(ElementSize)));
+        auto MulOp =
+            gmir::MulOp::create(Builder, Builder.getUnknownLoc(), OffsetTy,
+                                IdxVal, ElemSizeConst.getResult());
+        ScaledVal = MulOp.getResult();
+      }
+
+      // Raw (non-const-upgraded) flags for the variable-index add, per
+      // IRTranslator.cpp.
+      auto AddOp = gmir::PtrAddOp::create(
+          Builder, Builder.getUnknownLoc(), PtrTy, BaseVal, ScaledVal,
+          NoUWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          NoUSWrap ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          InBounds ? Builder.getUnitAttr() : mlir::UnitAttr());
+      BaseVal = AddOp.getResult();
+    }
+
+    if (Offset != 0)
+      EmitConstOffset(Offset);
+
+    ValueMap[&GEP] = BaseVal;
     return true;
   }
 
