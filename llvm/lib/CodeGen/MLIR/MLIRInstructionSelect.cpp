@@ -7,8 +7,9 @@
 //===----------------------------------------------------------------------===//
 //
 // Imports the current MachineFunction's llvm::Function into `gmir` ops
-// (GMIRImporter) and, if that succeeds, translates them into real generic
-// MIR (MLIRToGMIRTranslator). Both steps only ever handle the
+// (GMIRImporter), legalizes them against the target's real legality rules
+// (GMIRLegalizer) and, if both succeed, translates them into real generic
+// MIR (MLIRToGMIRTranslator). All three steps only ever handle the
 // currently-supported subset (straight-line scalar-integer arithmetic);
 // anything else makes the importer fail, in which case this pass defers to
 // the existing selector exactly as it always has.
@@ -16,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "GMIRImporter.h"
+#include "GMIRLegalizer.h"
 #include "IR/GMIRDialect.h"
 #include "MLIRToGMIRTranslator.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -36,8 +38,21 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/StackProtector.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
+
+// The permanent downstream target Legalizer MachineFunctionPass makes the
+// usual -global-isel asm-diff oracle unable to distinguish "GMIRLegalizer's
+// own pattern ran" from "the safety-net pass quietly did the work instead"
+// for any correctly-scoped legalization case. Dumping the gmir IR right
+// after legalize(), before translation, lets a FileCheck test grep for the
+// ops (e.g. gmir.uaddo/uadde/merge/unmerge) that only GMIRLegalizer's
+// patterns emit -- the real proof mechanism.
+static cl::opt<bool> PrintGMIRAfterLegalize(
+    "print-gmir-after-legalize", cl::Hidden,
+    cl::desc("Print the gmir IR right after GMIRLegalizer runs, before "
+             "MLIRToGMIRTranslator lowers it to real MIR"));
 
 namespace {
 // Deliberately skips the usual INITIALIZE_PASS/PassRegistry registration:
@@ -54,7 +69,19 @@ class MLIRInstructionSelect : public MachineFunctionPass {
 public:
   static char ID;
 
-  MLIRInstructionSelect() : MachineFunctionPass(ID) {}
+  // MLIRContext/dialect loading and the legalizer's pattern cache are
+  // pass-instance state, constructed once and reused across every
+  // runOnMachineFunction call (i.e. once per module, not once per
+  // function) -- a MachineFunctionPass instance is never shared across
+  // compilation threads in any parallel-codegen configuration, so no
+  // locking is needed for either. This is also a correctness prerequisite
+  // for the pattern cache (see GMIRLegalizer.h's LegalizerPatternCache
+  // doc): the cached patterns capture this Context by pointer, so it must
+  // outlive every function the cache serves.
+  MLIRInstructionSelect() : MachineFunctionPass(ID) {
+    Context.getOrLoadDialect<gmir::GMIRDialect>();
+    Context.getOrLoadDialect<mlir::func::FuncDialect>();
+  }
 
   StringRef getPassName() const override { return "MLIR Instruction Select"; }
 
@@ -86,15 +113,30 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    mlir::MLIRContext Context;
-    Context.getOrLoadDialect<gmir::GMIRDialect>();
-    Context.getOrLoadDialect<mlir::func::FuncDialect>();
-
     mlir::OwningOpRef<mlir::ModuleOp> Module(
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
     gmir::CallInstMap CallInsts;
     mlir::func::FuncOp FuncOp =
         gmir::importFunction(*Module, MF.getFunction(), CallInsts);
+
+    if (!FuncOp || !gmir::legalize(FuncOp, MF, PatternCache)) {
+      // Outside the currently-supported subset: defer to the existing
+      // selector, same as always.
+      MF.getProperties().setFailedISel();
+      return false;
+    }
+
+    if (PrintGMIRAfterLegalize) {
+      FuncOp.print(llvm::errs());
+      llvm::errs() << '\n';
+    }
+
+    // Everything below is only needed once import/legalization succeeded
+    // -- fetched here, after that check, rather than unconditionally up
+    // front, so a function outside the supported subset (the common case
+    // for real-world code today) doesn't pay for an unused BPI lookup, a
+    // TargetPassConfig analysis fetch, a CSE-config query, and
+    // createMIRBuilder's allocation before falling back.
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
 
     // Match IRTranslatorLegacy::runOnMachineFunction's own choice of
@@ -109,10 +151,10 @@ public:
     GISelCSEInfo *CSEInfo = &Wrapper.get(TPC.getCSEConfig());
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
-    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder,
-                                    CallInsts)) {
-      // Outside the currently-supported subset, or CallLowering itself
-      // declined: defer to the existing selector, same as always.
+    if (!gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder,
+                         CallInsts)) {
+      // CallLowering itself declined: defer to the existing selector,
+      // same as always.
       MF.getProperties().setFailedISel();
       return false;
     }
@@ -124,6 +166,10 @@ public:
     // passes even though it now describes a stale, pre-translation MF.
     return true;
   }
+
+private:
+  mlir::MLIRContext Context;
+  gmir::LegalizerPatternCache PatternCache;
 };
 } // namespace
 

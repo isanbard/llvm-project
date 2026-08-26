@@ -29,6 +29,13 @@ using namespace llvm::gmir;
 #define GET_OP_CLASSES
 #include "IR/GMIRDialectOps.cpp.inc"
 
+// ConstantOp::fold -- see GMIRDialect.td's `hasFolder = 1` comment on
+// gmir.constant: a ConstantLike op must return its own value attribute
+// from fold() (mirrors e.g. mlir::arith::ConstantOp::fold), which is what
+// callers like the greedy pattern rewrite driver's constant-CSE step rely
+// on via matchPattern(op, m_Constant()).
+OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) { return getValueAttr(); }
+
 // BranchOpInterface methods for GMIR_BrOp/GMIR_CondBrOp -- ODS only
 // declares these (DeclareOpInterfaceMethods), it doesn't define them.
 // Mirrors mlir::cf::BranchOp/CondBranchOp exactly
@@ -98,6 +105,54 @@ void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
     effects.emplace_back(mlir::MemoryEffects::Write::get());
     effects.emplace_back(mlir::MemoryEffects::Read::get());
   }
+}
+
+// Hand-written verifiers for GMIR_UnmergeOp/GMIR_MergeOp (`hasVerifier = 1`
+// in GMIRDialect.td -- ODS only declares these, it doesn't define them,
+// same as the BranchOpInterface/MemoryEffectsOpInterface methods above).
+// No stock ODS trait expresses "all *results* share one type"
+// (SameOperandsAndResultType doesn't fit either op: gmir.unmerge's single
+// operand legitimately differs in type from its results, and gmir.merge's
+// single result legitimately differs from its operands), so each is a
+// plain hand-rolled check, matching this file's existing style of direct,
+// unabstracted per-op logic rather than a shared two-op helper. Besides
+// the "all same type" check, also require the piece count times that
+// shared width to add up to the wide side's width (mirrors
+// buildUnmerge/buildMergeValues's own precondition: "the entire register
+// (and no more) must be covered by the input registers") -- with
+// useDefaultTypePrinterParser on, gmir IR round-trips through text, so a
+// width mismatch here is not something only correctly-constructed C++
+// callers can produce.
+LogicalResult UnmergeOp::verify() {
+  if (getDsts().empty())
+    return emitOpError("expected at least one result");
+  auto Ty = cast<gmir::LLTType>(getDsts().front().getType());
+  for (mlir::Value Dst : getDsts().drop_front())
+    if (Dst.getType() != Ty)
+      return emitOpError("all results must have the same type");
+  auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
+  if (Ty.getScalarSizeInBits() == 0 || SrcTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (SrcTy.getScalarSizeInBits() !=
+      Ty.getScalarSizeInBits() * getDsts().size())
+    return emitOpError("result bit widths must sum to the operand's width");
+  return success();
+}
+
+LogicalResult MergeOp::verify() {
+  if (getSrcs().empty())
+    return emitOpError("expected at least one operand");
+  auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
+  for (mlir::Value Src : getSrcs().drop_front())
+    if (Src.getType() != Ty)
+      return emitOpError("all operands must have the same type");
+  auto DstTy = cast<gmir::LLTType>(getDst().getType());
+  if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (DstTy.getScalarSizeInBits() !=
+      Ty.getScalarSizeInBits() * getSrcs().size())
+    return emitOpError("operand bit widths must sum to the result's width");
+  return success();
 }
 
 void GMIRDialect::initialize() {
