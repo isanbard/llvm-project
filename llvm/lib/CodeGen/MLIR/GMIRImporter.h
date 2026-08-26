@@ -26,10 +26,8 @@ namespace gmir {
 
 /// Imports F into a new mlir::func::FuncOp appended to Module, as `gmir`
 /// ops. Returns a null FuncOp -- without building anything further -- the
-/// moment F contains anything outside the currently-supported subset: a
-/// non-integer type (or an integer wider than 64 bits), an unstructured
-/// terminator (e.g. `switch`, `indirectbr`), or an instruction opcode
-/// other than add/sub/mul/sdiv/and/or/xor/icmp/br/ret.
+/// moment F contains anything outside the currently-supported subset (see
+/// GMIRImporter.cpp's per-instruction dispatch for the exact list).
 mlir::func::FuncOp importFunction(mlir::ModuleOp Module, llvm::Function &F);
 
 } // namespace gmir

@@ -125,4 +125,66 @@ def GMIR_CondBrOp : GMIR_Op<"brcond", [Pure, Terminator, AttrSizedOperandSegment
   let successors = (successor AnySuccessor:$trueDest, AnySuccessor:$falseDest);
 }
 
+def GMIR_AllocaOp : GMIR_Op<"alloca"> {
+  let summary = "Static stack allocation, mirroring G_FRAME_INDEX";
+  let description = [{
+    Static-only: constant size, entry-block placement in the original IR
+    (`llvm::AllocaInst::isStaticAlloca()`). Dynamic-sized or non-entry-block
+    allocas fall back to the legacy selector rather than being modeled here.
+    Deliberately named without a "static_" prefix so a future
+    `gmir.dyn_alloca` (mirroring `G_DYN_STACKALLOC`) reads as a natural
+    sibling op rather than a retrofit -- matches how GlobalISel itself keeps
+    these as two separate opcodes rather than one polymorphic one.
+  }];
+  let arguments = (ins I64Attr:$size, I64Attr:$align);
+  let results = (outs GMIR_LLTType:$res); // always a pointer LLT
+}
+
+def GMIR_LoadOp : GMIR_Op<"load",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Load from memory, mirroring GlobalISel's G_LOAD";
+  let description = [{
+    `ordering`/`syncscope` hold the raw `llvm::AtomicOrdering`/
+    `SyncScope::ID` integer values (0 = NotAtomic / System) -- a plain
+    attribute rather than a new MLIR enum-attr, matching `gmir.icmp`'s
+    predicate. Carried from day one rather than added only once atomics are
+    needed: `MachineMemOperand`'s constructor threads ordering/syncscope in
+    alongside size/alignment, so adding them to this op later would be a
+    breaking shape change, not an additive one. For a struct/array-typed
+    load, the importer will eventually emit one `gmir.load` per flattened
+    scalar/pointer leaf rather than a single multi-result op -- mirrors
+    IRTranslator's multi-register loop, not a new gmir-level aggregate
+    concept -- though only the single-leaf case is wired up so far.
+
+    `isInvariant`/`isNonTemporal` mirror `TargetLoweringBase::
+    getLoadMemOperandFlags`'s `MOInvariant`/`MONonTemporal` derivation from
+    the source `!invariant.load`/`!nontemporal` metadata -- a plain
+    presence check, no analysis dependency, unlike `MODereferenceable`
+    (deliberately not modeled here: the real derivation needs
+    `isDereferenceableAndAlignedPointer`, which needs `AssumptionCache`/
+    `TargetLibraryInfo` that the importer doesn't have threaded in, and the
+    cheaper `!dereferenceable`-metadata-only fallback is narrow enough not
+    to be worth the op-shape churn until something needs it).
+  }];
+  let arguments = (ins GMIR_LLTType:$ptr, I64Attr:$align, I64Attr:$ordering,
+                       I64Attr:$syncscope, UnitAttr:$isVolatile,
+                       UnitAttr:$isInvariant, UnitAttr:$isNonTemporal);
+  let results = (outs GMIR_LLTType:$res);
+}
+
+def GMIR_StoreOp : GMIR_Op<"store",
+    [DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Store to memory, mirroring GlobalISel's G_STORE";
+  let description = [{
+    See `gmir.load` for the `ordering`/`syncscope` attribute convention and
+    the "one op per flattened leaf" aggregate-decomposition approach.
+    `isNonTemporal` mirrors `TargetLoweringBase::getStoreMemOperandFlags`
+    exactly (which, unlike the load side, has no invariant or
+    dereferenceable concept for stores at all).
+  }];
+  let arguments = (ins GMIR_LLTType:$value, GMIR_LLTType:$ptr, I64Attr:$align,
+                       I64Attr:$ordering, I64Attr:$syncscope,
+                       UnitAttr:$isVolatile, UnitAttr:$isNonTemporal);
+}
+
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD

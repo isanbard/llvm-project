@@ -18,16 +18,22 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/CodeGenTypes/LowLevelType.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 
 using namespace llvm;
 
-static LLT convertLLT(gmir::LLTType Ty) {
-  // GMIRImporter only ever produces scalar-integer !gmir.llt values. Uses
-  // LLT::integer() specifically, not the more general LLT::scalar(): some
-  // targets' InstructionSelect patterns require isInteger() on their
-  // generic MIR operands, which only LLT::integer() satisfies.
+// scalarSizeInBits == 0 means "pointer in addressSpace" (see GMIRDialect.td's
+// !gmir.llt doc comment) -- pointer size itself needs a DataLayout, hence
+// the extra parameter. Every other !gmir.llt is a scalar integer; uses
+// LLT::integer() specifically, not the more general LLT::scalar(): some
+// targets' InstructionSelect patterns require isInteger() on their generic
+// MIR operands, which only LLT::integer() satisfies.
+static LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
+  if (Ty.getScalarSizeInBits() == 0)
+    return LLT::pointer(Ty.getAddressSpace(),
+                        DL.getPointerSizeInBits(Ty.getAddressSpace()));
   return LLT::integer(Ty.getScalarSizeInBits());
 }
 
@@ -50,7 +56,8 @@ class GMIRToMIRWalker {
 public:
   GMIRToMIRWalker(MachineFunction &MF, MachineIRBuilder &MIRBuilder,
                   const CallLowering &CLI, const BranchProbabilityInfo &BPI)
-      : MF(MF), MIRBuilder(MIRBuilder), CLI(CLI), BPI(BPI) {}
+      : MF(MF), MIRBuilder(MIRBuilder), CLI(CLI), BPI(BPI),
+        DL(MF.getDataLayout()) {}
 
   bool run(mlir::func::FuncOp FuncOp, Function &F,
            FunctionLoweringInfo &FuncInfo) {
@@ -80,7 +87,7 @@ public:
       MIRBuilder.setMBB(*BlockMap[&BB]);
       SmallVector<MachineInstr *, 4> Skeletons;
       for (mlir::BlockArgument Arg : BB.getArguments()) {
-        LLT Ty = convertLLT(cast<gmir::LLTType>(Arg.getType()));
+        LLT Ty = convertLLT(cast<gmir::LLTType>(Arg.getType()), DL);
         Register Reg = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
         ValueToReg[Arg] = Reg;
         auto MIB = MIRBuilder.buildInstr(TargetOpcode::G_PHI, {Reg}, {});
@@ -130,7 +137,7 @@ private:
     SmallVector<ArrayRef<Register>, 8> VRegArgs;
     for (mlir::BlockArgument Arg : EntryBB.getArguments()) {
       Register Reg = MIRBuilder.getMRI()->createGenericVirtualRegister(
-          convertLLT(cast<gmir::LLTType>(Arg.getType())));
+          convertLLT(cast<gmir::LLTType>(Arg.getType()), DL));
       ValueToReg[Arg] = Reg;
       ArgRegStorage.push_back({Reg});
       VRegArgs.push_back(ArgRegStorage.back());
@@ -214,7 +221,8 @@ private:
 
   bool translateOp(mlir::Operation &Op) {
     if (auto ConstOp = dyn_cast<gmir::ConstantOp>(&Op)) {
-      LLT Ty = convertLLT(cast<gmir::LLTType>(ConstOp.getResult().getType()));
+      LLT Ty =
+          convertLLT(cast<gmir::LLTType>(ConstOp.getResult().getType()), DL);
       // GMIRImporter always stores gmir.constant's value sign-extended to
       // 64 bits (I64Attr), regardless of the actual !gmir.llt width, so it
       // must be truncated back down here -- buildConstant asserts the
@@ -229,7 +237,7 @@ private:
     if (auto ICmp = dyn_cast<gmir::ICmpOp>(&Op)) {
       Register LHS = ValueToReg.lookup(ICmp.getLhs());
       Register RHS = ValueToReg.lookup(ICmp.getRhs());
-      LLT Ty = convertLLT(cast<gmir::LLTType>(ICmp.getResult().getType()));
+      LLT Ty = convertLLT(cast<gmir::LLTType>(ICmp.getResult().getType()), DL);
       auto Pred = static_cast<CmpInst::Predicate>(
           ICmp.getPredicateAttr().getValue().getSExtValue());
       auto MIB = MIRBuilder.buildICmp(Pred, Ty, LHS, RHS);
@@ -241,7 +249,7 @@ private:
   if (auto BinOp = dyn_cast<gmir::OpTy>(&Op)) {                                \
     Register LHS = ValueToReg.lookup(BinOp.getLhs());                          \
     Register RHS = ValueToReg.lookup(BinOp.getRhs());                          \
-    LLT Ty = convertLLT(cast<gmir::LLTType>(BinOp.getResult().getType()));     \
+    LLT Ty = convertLLT(cast<gmir::LLTType>(BinOp.getResult().getType()), DL); \
     auto MIB = Build;                                                          \
     ValueToReg[BinOp.getResult()] = MIB.getReg(0);                             \
     return true;                                                               \
@@ -256,15 +264,86 @@ private:
         SDivOp, MIRBuilder.buildInstr(TargetOpcode::G_SDIV, {Ty}, {LHS, RHS}))
 #undef GMIR_BINOP_CASE
 
+    if (auto Alloca = dyn_cast<gmir::AllocaOp>(&Op)) {
+      LLT Ty =
+          convertLLT(cast<gmir::LLTType>(Alloca.getResult().getType()), DL);
+      int FI = MF.getFrameInfo().CreateStackObject(
+          Alloca.getSizeAttr().getInt(), Align(Alloca.getAlignAttr().getInt()),
+          /*isSpillSlot=*/false);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildFrameIndex(Res, FI);
+      ValueToReg[Alloca.getResult()] = Res;
+      return true;
+    }
+
+    if (auto Load = dyn_cast<gmir::LoadOp>(&Op)) {
+      Register PtrReg = ValueToReg.lookup(Load.getPtr());
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Load.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
+      if (Load.getIsInvariant())
+        ExtraFlags |= MachineMemOperand::MOInvariant;
+      if (Load.getIsNonTemporal())
+        ExtraFlags |= MachineMemOperand::MONonTemporal;
+      MachineMemOperand *MMO = buildMMO(
+          MachineMemOperand::MOLoad | ExtraFlags, Ty,
+          Load.getAlignAttr().getInt(), Load.getOrderingAttr().getInt(),
+          Load.getSyncscopeAttr().getInt(), Load.getIsVolatile());
+      MIRBuilder.buildLoad(Res, PtrReg, *MMO);
+      ValueToReg[Load.getResult()] = Res;
+      return true;
+    }
+
+    if (auto Store = dyn_cast<gmir::StoreOp>(&Op)) {
+      Register ValReg = ValueToReg.lookup(Store.getValue());
+      Register PtrReg = ValueToReg.lookup(Store.getPtr());
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Store.getValue().getType()), DL);
+      MachineMemOperand::Flags ExtraFlags = MachineMemOperand::MONone;
+      if (Store.getIsNonTemporal())
+        ExtraFlags |= MachineMemOperand::MONonTemporal;
+      MachineMemOperand *MMO = buildMMO(
+          MachineMemOperand::MOStore | ExtraFlags, Ty,
+          Store.getAlignAttr().getInt(), Store.getOrderingAttr().getInt(),
+          Store.getSyncscopeAttr().getInt(), Store.getIsVolatile());
+      MIRBuilder.buildStore(ValReg, PtrReg, *MMO);
+      return true;
+    }
+
     // GMIRImporter only ever emits the ops handled above (plus
     // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
     return false;
+  }
+
+  /// Shared MMO construction for gmir.load/gmir.store. MOInvariant/
+  /// MONonTemporal (set by the two callers above, from gmir.load/store's
+  /// isInvariant/isNonTemporal attrs) are passed in via BaseFlags, mirroring
+  /// TargetLoweringBase::getLoadMemOperandFlags/getStoreMemOperandFlags
+  /// exactly. MachinePointerInfo is left "unknown" (no Value-based
+  /// provenance) and AAMDNodes are left empty -- AA metadata is a pure
+  /// optimization hint, safe to omit, and not carried through gmir today,
+  /// unlike ordering (a correctness-affecting field once atomics are in
+  /// play). MODereferenceable is never set either: its real derivation
+  /// needs isDereferenceableAndAlignedPointer, which needs an
+  /// AssumptionCache/TargetLibraryInfo the importer doesn't have threaded
+  /// in (see gmir.load's doc comment) -- all deliberate, still-scoped-out
+  /// exclusions, not oversights.
+  MachineMemOperand *buildMMO(MachineMemOperand::Flags BaseFlags, LLT Ty,
+                              int64_t AlignBytes, int64_t OrderingVal,
+                              int64_t SyncScopeVal, bool IsVolatile) {
+    MachineMemOperand::Flags Flags = BaseFlags;
+    if (IsVolatile)
+      Flags |= MachineMemOperand::MOVolatile;
+    return MF.getMachineMemOperand(MachinePointerInfo(), Flags, Ty,
+                                   Align(AlignBytes), MMOMetadata(),
+                                   static_cast<SyncScope::ID>(SyncScopeVal),
+                                   static_cast<AtomicOrdering>(OrderingVal));
   }
 
   MachineFunction &MF;
   MachineIRBuilder &MIRBuilder;
   const CallLowering &CLI;
   const BranchProbabilityInfo &BPI;
+  const llvm::DataLayout &DL;
   llvm::DenseMap<mlir::Value, Register> ValueToReg;
   llvm::DenseMap<mlir::Block *, MachineBasicBlock *> BlockMap;
   llvm::DenseMap<mlir::Block *, SmallVector<MachineInstr *, 4>> SkeletonPhis;

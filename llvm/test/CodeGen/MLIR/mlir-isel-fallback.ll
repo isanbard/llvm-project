@@ -3,20 +3,28 @@
 ; RUN: diff %t.normal.s %t.mlir.s
 ;
 ; Verifies the fallback path for functions genuinely outside the currently-
-; supported subset (a call, and a switch; see
+; supported subset (a call, a switch, and a dynamic-size alloca; see
 ; llvm/lib/CodeGen/MLIR/GMIRImporter.cpp, whose per-instruction dispatch has
-; no case for either). -enable-mlir-isel must produce byte-identical output
-; to a normal llc invocation here in every build configuration:
+; no case for calls/switches, and whose importAlloca bails on
+; !AllocaInst::isStaticAlloca()). -enable-mlir-isel must produce
+; byte-identical output to a normal llc invocation here in every build
+; configuration:
 ;  - builds without -DLLVM_ENABLE_MLIR_ISEL=ON degrade immediately
 ;    (createMLIRInstructionSelectPass() returns nullptr);
-;  - builds with it on run the real pass, whose importer declines (neither
-;    function is in the supported subset), so it marks the
+;  - builds with it on run the real pass, whose importer declines (none of
+;    these functions are in the supported subset), so it marks the
 ;    MachineFunction's ISel as failed and falls back via the same
 ;    ResetMachineFunctionPass + SelectionDAG path GlobalISel uses.
 ;
-; (Straight-line scalar arithmetic and structured if/else/loop control flow
-; are genuinely translated instead of always falling back; see
-; scalar-arith.ll and control-flow.ll.)
+; (Straight-line scalar arithmetic, structured if/else/loop control flow,
+; and static-alloca/load/store are genuinely translated instead of always
+; falling back; see scalar-arith.ll, control-flow.ll, and memory-ops.ll.)
+;
+; @huge_alloca covers importAlloca's int64 overflow guard: an allocation
+; size at or above 2^63 doesn't overflow the uint64_t byte-count
+; computation, but does overflow the int64_t attribute the gmir op stores
+; it in, so it must be rejected explicitly rather than silently
+; reinterpreted as negative.
 
 declare i32 @callee(i32)
 
@@ -48,4 +56,20 @@ case1:
   ret i32 20
 default:
   ret i32 30
+}
+
+define i32 @dynamic_alloca(i32 %n) {
+entry:
+  %p = alloca i32, i32 %n
+  store i32 0, ptr %p
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+define i8 @huge_alloca() {
+entry:
+  %p = alloca i8, i64 9223372036854775808
+  store i8 0, ptr %p
+  %v = load i8, ptr %p
+  ret i8 %v
 }

@@ -36,3 +36,19 @@ case1:
 default:
   ret i32 30
 }
+
+define i32 @dynamic_alloca(i32 %n) {
+entry:
+  %p = alloca i32, i32 %n
+  store i32 0, ptr %p
+  %v = load i32, ptr %p
+  ret i32 %v
+}
+
+define i8 @huge_alloca() {
+entry:
+  %p = alloca i8, i64 9223372036854775808
+  store i8 0, ptr %p
+  %v = load i8, ptr %p
+  ret i8 %v
+}
