@@ -31,6 +31,12 @@
 ; a vector-typed GEP, and a variable index whose bit width doesn't match
 ; the pointer-index type's width (gmir has no sext/trunc op yet to fix
 ; that up).
+;
+; @load_struct_with_float covers computeGMIRLeafTypes failing on a leaf
+; type convertType can't represent (float) -- confirms the whole
+; load/store bails cleanly rather than partially emitting ops for the
+; leaves it could handle (see aggregate-memops.ll for the genuinely-
+; translated aggregate load/store cases).
 
 declare i32 @callee(i32)
 
@@ -91,4 +97,11 @@ entry:
   %g = getelementptr i32, ptr %p, i32 %i
   %v = load i32, ptr %g
   ret i32 %v
+}
+
+define void @load_struct_with_float(ptr %src, ptr %dst) {
+entry:
+  %s = load {i32, float}, ptr %src
+  store {i32, float} %s, ptr %dst
+  ret void
 }

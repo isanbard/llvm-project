@@ -65,3 +65,10 @@ entry:
   %v = load i32, ptr %g
   ret i32 %v
 }
+
+define void @load_struct_with_float(ptr %src, ptr %dst) {
+entry:
+  %s = load {i32, float}, ptr %src
+  store {i32, float} %s, ptr %dst
+  ret void
+}

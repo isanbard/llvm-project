@@ -9,6 +9,8 @@
 #include "GMIRImporter.h"
 #include "IR/GMIRDialect.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/CodeGen/Analysis.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
@@ -16,6 +18,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
 #include <optional>
@@ -77,55 +80,43 @@ static std::optional<int64_t> checkedU64ToI64(uint64_t V) {
 
 namespace {
 
-/// Recursively flattens an (possibly aggregate) llvm::Type into its leaf
-/// scalar/pointer !gmir.llt types plus each leaf's byte offset within Ty:
-/// struct fields via DataLayout::getStructLayout(), array elements via
-/// `i * EltSize`. Every SSA value in the importer is conceptually backed by
-/// a list of leaf mlir::Values (see FunctionImporter::ValueMap), the same
-/// way IRTranslator backs every llvm::Value with ArrayRef<Register> rather
-/// than Register -- LLT (and so !gmir.llt) has no aggregate representation,
-/// only scalar/vector/pointer. Void produces zero leaves. Returns false
-/// (leaving Types/Offsets in a possibly-partial state) if any leaf isn't a
-/// supported scalar/pointer type.
+/// Flattens an (possibly aggregate) llvm::Type into its leaf scalar/pointer
+/// !gmir.llt types plus each leaf's byte offset within Ty. Every SSA value
+/// in the importer is conceptually backed by a list of leaf mlir::Values
+/// (see FunctionImporter::ValueMap), the same way IRTranslator backs every
+/// llvm::Value with ArrayRef<Register> rather than Register -- LLT (and so
+/// !gmir.llt) has no aggregate representation, only scalar/vector/pointer.
+/// Void produces zero leaves. Returns false (leaving Types/Offsets in a
+/// possibly-partial state) if any leaf isn't a supported scalar/pointer
+/// type, or if any leaf's offset is scalable (!gmir.llt/gmir ops have no
+/// way to represent a vscale-dependent byte offset).
+///
+/// The actual struct/array recursion is llvm::ComputeValueTypes
+/// (llvm/CodeGen/Analysis.h) -- the same representation-agnostic walker
+/// IRTranslator's own computeValueLLTs is a thin wrapper over (it just maps
+/// ComputeValueTypes's leaf llvm::Types through getLLTForType; this does
+/// the same through convertType instead). Reusing it directly, rather than
+/// hand-porting the struct/array walk, means any future correctness fix to
+/// it benefits every caller without a separate re-port -- and it already
+/// handles a scalable type nested inside a struct/array correctly via
+/// TypeSize-preserving arithmetic throughout, not just a direct array
+/// element.
 bool computeGMIRLeafTypes(mlir::MLIRContext &Context,
                           const llvm::DataLayout &DL, llvm::Type *Ty,
                           SmallVectorImpl<gmir::LLTType> &Types,
-                          SmallVectorImpl<uint64_t> &Offsets,
-                          uint64_t StartOffset = 0) {
-  if (Ty->isVoidTy())
-    return true;
-  if (auto *StTy = dyn_cast<llvm::StructType>(Ty)) {
-    const StructLayout *SL = DL.getStructLayout(StTy);
-    for (unsigned I = 0, E = StTy->getNumElements(); I != E; ++I) {
-      if (!computeGMIRLeafTypes(Context, DL, StTy->getElementType(I), Types,
-                                Offsets, StartOffset + SL->getElementOffset(I)))
-        return false;
-    }
-    return true;
-  }
-  if (auto *ArrTy = dyn_cast<llvm::ArrayType>(Ty)) {
-    llvm::Type *ElemTy = ArrTy->getElementType();
-    // getTypeAllocSize returns a TypeSize, not a plain integer: for a
-    // scalable element type its implicit conversion to uint64_t would
-    // call reportFatalInternalError and abort the whole compiler, not
-    // fail gracefully like every other unsupported-type path in this
-    // function. Bail explicitly instead.
-    TypeSize ElemSizeTS = DL.getTypeAllocSize(ElemTy);
-    if (ElemSizeTS.isScalable())
+                          SmallVectorImpl<uint64_t> &Offsets) {
+  SmallVector<llvm::Type *, 1> LeafIRTypes;
+  SmallVector<TypeSize, 1> LeafOffsets;
+  llvm::ComputeValueTypes(DL, Ty, LeafIRTypes, &LeafOffsets);
+  for (auto [LeafIRTy, LeafOffset] : zip(LeafIRTypes, LeafOffsets)) {
+    if (LeafOffset.isScalable())
       return false;
-    uint64_t ElemSize = ElemSizeTS.getFixedValue();
-    for (uint64_t I = 0, E = ArrTy->getNumElements(); I != E; ++I) {
-      if (!computeGMIRLeafTypes(Context, DL, ElemTy, Types, Offsets,
-                                StartOffset + I * ElemSize))
-        return false;
-    }
-    return true;
+    gmir::LLTType LeafTy = convertType(Context, LeafIRTy);
+    if (!LeafTy)
+      return false;
+    Types.push_back(LeafTy);
+    Offsets.push_back(LeafOffset.getFixedValue());
   }
-  gmir::LLTType LeafTy = convertType(Context, Ty);
-  if (!LeafTy)
-    return false;
-  Types.push_back(LeafTy);
-  Offsets.push_back(StartOffset);
   return true;
 }
 
@@ -146,7 +137,7 @@ public:
   /// Returns false the moment an unsupported construct is seen.
   bool import(Function &F, mlir::func::FuncOp FuncOp) {
     DL = &F.getParent()->getDataLayout();
-    // Memoized constants (see getOperand) are materialized at a fixed,
+    // Memoized constants (see getOperands) are materialized at a fixed,
     // growing-forward cursor at the very front of the entry block, mirroring
     // IRTranslator's own dedicated EntryBuilder: the entry block dominates
     // every other block, and ops preceding all others in it precede
@@ -161,7 +152,7 @@ public:
 
     unsigned ArgIdx = 0;
     for (Argument &Arg : F.args())
-      ValueMap[&Arg] = FuncOp.getArgument(ArgIdx++);
+      ValueMap[&Arg] = {FuncOp.getArgument(ArgIdx++)};
 
     // Pass 1: entry block already exists (FuncOp.addEntryBlock()); create
     // one mlir::Block per remaining BasicBlock, with one block argument
@@ -188,7 +179,7 @@ public:
 
       unsigned PhiIdx = 0;
       for (PHINode &PN : BB.phis())
-        ValueMap[&PN] = MLIRBB->getArgument(PhiIdx++);
+        ValueMap[&PN] = {MLIRBB->getArgument(PhiIdx++)};
     }
 
     // Pass 2: translate each block's non-PHI instructions.
@@ -264,8 +255,8 @@ private:
     if (!ResTy)
       return false;
     mlir::Value LHS, RHS;
-    if (!getOperand(BinOp.getOperand(0), LHS) ||
-        !getOperand(BinOp.getOperand(1), RHS))
+    if (!getScalarOperand(BinOp.getOperand(0), LHS) ||
+        !getScalarOperand(BinOp.getOperand(1), RHS))
       return false;
 
     mlir::Location Loc = Builder.getUnknownLoc();
@@ -296,7 +287,7 @@ private:
       // Unsigned div/rem, signed rem, shifts, float ops, etc: deferred.
       return false;
     }
-    ValueMap[&BinOp] = Op->getResult(0);
+    ValueMap[&BinOp] = {Op->getResult(0)};
     return true;
   }
 
@@ -305,14 +296,14 @@ private:
     if (!ResTy)
       return false;
     mlir::Value LHS, RHS;
-    if (!getOperand(ICmp.getOperand(0), LHS) ||
-        !getOperand(ICmp.getOperand(1), RHS))
+    if (!getScalarOperand(ICmp.getOperand(0), LHS) ||
+        !getScalarOperand(ICmp.getOperand(1), RHS))
       return false;
     auto Op = gmir::ICmpOp::create(
         Builder, Builder.getUnknownLoc(), ResTy,
         Builder.getI64IntegerAttr(static_cast<int64_t>(ICmp.getPredicate())),
         LHS, RHS);
-    ValueMap[&ICmp] = Op.getResult();
+    ValueMap[&ICmp] = {Op.getResult()};
     return true;
   }
 
@@ -362,21 +353,59 @@ private:
         Builder, Builder.getUnknownLoc(), ResTy,
         Builder.getI64IntegerAttr(*SignedSizeBytes),
         Builder.getI64IntegerAttr(AI.getAlign().value()));
-    ValueMap[&AI] = Op.getResult();
+    ValueMap[&AI] = {Op.getResult()};
     return true;
   }
 
-  /// Scalar/pointer only for now -- an aggregate-typed load bails here (leaf
-  /// count != 1); aggregate flattening is added on top of this same helper
-  /// later.
+  /// Returns BasePtr unchanged when Offset==0 (skip-if-zero, mirroring
+  /// MachineIRBuilder::materializePtrAdd's short-circuit -- the common
+  /// case, since most loads/stores are scalar/pointer with a single
+  /// zero-offset leaf), else emits gmir.constant(Offset) +
+  /// gmir.ptr_add(BasePtr, that constant) with NoUWrap+InBounds set
+  /// unconditionally (mirrors MachineIRBuilder::materializeObjectPtrOffset's
+  /// fixed flags -- this is sub-object offset math within an already-valid
+  /// object, not a user GEP, so it always gets the strong nuw+inbounds
+  /// guarantee regardless of anything else).
+  mlir::Value materializeLeafPtr(mlir::Value BasePtr, gmir::LLTType PtrTy,
+                                 gmir::LLTType OffsetTy, uint64_t Offset) {
+    if (Offset == 0)
+      return BasePtr;
+    auto ConstOp = gmir::ConstantOp::create(
+        Builder, Builder.getUnknownLoc(), OffsetTy,
+        Builder.getI64IntegerAttr(static_cast<int64_t>(Offset)));
+    auto AddOp = gmir::PtrAddOp::create(
+        Builder, Builder.getUnknownLoc(), PtrTy, BasePtr, ConstOp.getResult(),
+        /*NoUWrap=*/Builder.getUnitAttr(), /*NoUSWrap=*/mlir::UnitAttr(),
+        /*InBounds=*/Builder.getUnitAttr());
+    return AddOp.getResult();
+  }
+
+  /// Flattens an aggregate-typed load into one gmir.load per leaf (each at
+  /// its own already-resolved offset pointer, per-leaf alignment via
+  /// commonAlignment -- sub-object alignment is generally weaker than the
+  /// whole aggregate's, mirroring IRTranslator::translateLoad's
+  /// multi-register loop), collecting the results into ValueMap[&LI]. A
+  /// plain scalar/pointer load is just the trivial single-leaf,
+  /// zero-offset case of the same code path.
   bool importLoad(LoadInst &LI) {
     SmallVector<gmir::LLTType, 1> LeafTypes;
     SmallVector<uint64_t, 1> Offsets;
-    if (!computeGMIRLeafTypes(Context, *DL, LI.getType(), LeafTypes, Offsets) ||
-        LeafTypes.size() != 1)
+    if (!computeGMIRLeafTypes(Context, *DL, LI.getType(), LeafTypes, Offsets))
       return false;
-    mlir::Value Ptr;
-    if (!getOperand(LI.getPointerOperand(), Ptr))
+    mlir::Value BasePtr;
+    if (!getScalarOperand(LI.getPointerOperand(), BasePtr))
+      return false;
+    llvm::Type *PtrIRTy = LI.getPointerOperand()->getType();
+    gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+    // Unlike PtrTy (pointers always convert successfully -- convertType has
+    // no width restriction for them), the pointer's index type is an
+    // *integer* whose width is datalayout-defined, not statically bounded,
+    // so it can hit convertType's >64-bit rejection on an unusual custom
+    // datalayout (e.g. `p:128:128`). Bail like every other convertType-
+    // consuming path in this file, rather than handing a null type to gmir
+    // op construction below.
+    gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    if (!OffsetTy)
       return false;
     // isInvariant/isNonTemporal mirror TargetLoweringBase::
     // getLoadMemOperandFlags's MOInvariant/MONonTemporal derivation exactly
@@ -392,27 +421,45 @@ private:
     mlir::UnitAttr IsNonTemporal = LI.hasMetadata(LLVMContext::MD_nontemporal)
                                        ? Builder.getUnitAttr()
                                        : mlir::UnitAttr();
-    auto Op = gmir::LoadOp::create(
-        Builder, Builder.getUnknownLoc(), LeafTypes[0], Ptr,
-        Builder.getI64IntegerAttr(LI.getAlign().value()),
-        Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getOrdering())),
-        Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getSyncScopeID())),
-        LI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(), IsInvariant,
-        IsNonTemporal);
-    ValueMap[&LI] = Op.getResult();
+    SmallVector<mlir::Value, 1> Results;
+    for (auto [LeafTy, Offset] : zip(LeafTypes, Offsets)) {
+      mlir::Value LeafPtr =
+          materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
+      Align LeafAlign = commonAlignment(LI.getAlign(), Offset);
+      auto Op = gmir::LoadOp::create(
+          Builder, Builder.getUnknownLoc(), LeafTy, LeafPtr,
+          Builder.getI64IntegerAttr(LeafAlign.value()),
+          Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getOrdering())),
+          Builder.getI64IntegerAttr(static_cast<int64_t>(LI.getSyncScopeID())),
+          LI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          IsInvariant, IsNonTemporal);
+      Results.push_back(Op.getResult());
+    }
+    ValueMap[&LI] = std::move(Results);
     return true;
   }
 
+  /// Symmetric to importLoad: flattens an aggregate-typed store's value
+  /// operand into one gmir.store per leaf.
   bool importStore(StoreInst &SI) {
     SmallVector<gmir::LLTType, 1> LeafTypes;
     SmallVector<uint64_t, 1> Offsets;
     if (!computeGMIRLeafTypes(Context, *DL, SI.getValueOperand()->getType(),
-                              LeafTypes, Offsets) ||
-        LeafTypes.size() != 1)
+                              LeafTypes, Offsets))
       return false;
-    mlir::Value Val, Ptr;
-    if (!getOperand(SI.getValueOperand(), Val) ||
-        !getOperand(SI.getPointerOperand(), Ptr))
+    SmallVector<mlir::Value, 1> ValueLeaves;
+    mlir::Value BasePtr;
+    if (!getOperands(SI.getValueOperand(), ValueLeaves) ||
+        ValueLeaves.size() != LeafTypes.size() ||
+        !getScalarOperand(SI.getPointerOperand(), BasePtr))
+      return false;
+    llvm::Type *PtrIRTy = SI.getPointerOperand()->getType();
+    gmir::LLTType PtrTy = convertType(Context, PtrIRTy);
+    // See importLoad's identical check above for why OffsetTy (unlike
+    // PtrTy) needs one -- its width is datalayout-defined, not statically
+    // bounded.
+    gmir::LLTType OffsetTy = convertType(Context, DL->getIndexType(PtrIRTy));
+    if (!OffsetTy)
       return false;
     // Mirrors TargetLoweringBase::getStoreMemOperandFlags's MONonTemporal
     // derivation exactly (stores have no invariant or dereferenceable
@@ -420,13 +467,18 @@ private:
     mlir::UnitAttr IsNonTemporal = SI.hasMetadata(LLVMContext::MD_nontemporal)
                                        ? Builder.getUnitAttr()
                                        : mlir::UnitAttr();
-    gmir::StoreOp::create(
-        Builder, Builder.getUnknownLoc(), Val, Ptr,
-        Builder.getI64IntegerAttr(SI.getAlign().value()),
-        Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getOrdering())),
-        Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
-        SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
-        IsNonTemporal);
+    for (auto [ValueLeaf, Offset] : zip(ValueLeaves, Offsets)) {
+      mlir::Value LeafPtr =
+          materializeLeafPtr(BasePtr, PtrTy, OffsetTy, Offset);
+      Align LeafAlign = commonAlignment(SI.getAlign(), Offset);
+      gmir::StoreOp::create(
+          Builder, Builder.getUnknownLoc(), ValueLeaf, LeafPtr,
+          Builder.getI64IntegerAttr(LeafAlign.value()),
+          Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getOrdering())),
+          Builder.getI64IntegerAttr(static_cast<int64_t>(SI.getSyncScopeID())),
+          SI.isVolatile() ? Builder.getUnitAttr() : mlir::UnitAttr(),
+          IsNonTemporal);
+    }
     return true;
   }
 
@@ -458,12 +510,12 @@ private:
       return false;
 
     mlir::Value BaseVal;
-    if (!getOperand(GEP.getPointerOperand(), BaseVal))
+    if (!getScalarOperand(GEP.getPointerOperand(), BaseVal))
       return false;
 
     auto &GEPOp = cast<GEPOperator>(GEP);
     if (GEPOp.hasAllZeroIndices()) {
-      ValueMap[&GEP] = BaseVal;
+      ValueMap[&GEP] = {BaseVal};
       return true;
     }
 
@@ -551,7 +603,7 @@ private:
       }
 
       mlir::Value IdxVal;
-      if (!getOperand(Idx, IdxVal))
+      if (!getScalarOperand(Idx, IdxVal))
         return false;
 
       mlir::Value ScaledVal = IdxVal;
@@ -578,7 +630,7 @@ private:
     if (Offset != 0)
       EmitConstOffset(Offset);
 
-    ValueMap[&GEP] = BaseVal;
+    ValueMap[&GEP] = {BaseVal};
     return true;
   }
 
@@ -589,7 +641,7 @@ private:
       return true;
     }
     mlir::Value MLIRRetVal;
-    if (!getOperand(RetVal, MLIRRetVal))
+    if (!getScalarOperand(RetVal, MLIRRetVal))
       return false;
     mlir::func::ReturnOp::create(Builder, Builder.getUnknownLoc(), MLIRRetVal);
     return true;
@@ -607,7 +659,7 @@ private:
 
   bool importCondBr(CondBrInst &Br) {
     mlir::Value Cond;
-    if (!getOperand(Br.getCondition(), Cond))
+    if (!getScalarOperand(Br.getCondition(), Cond))
       return false;
     SmallVector<mlir::Value> TrueOperands, FalseOperands;
     if (!getSuccessorOperands(*Br.getParent(), *Br.getSuccessor(0),
@@ -629,23 +681,28 @@ private:
                             SmallVectorImpl<mlir::Value> &Operands) {
     for (PHINode &PN : ToBB.phis()) {
       mlir::Value V;
-      if (!getOperand(PN.getIncomingValueForBlock(&FromBB), V))
+      if (!getScalarOperand(PN.getIncomingValueForBlock(&FromBB), V))
         return false;
       Operands.push_back(V);
     }
     return true;
   }
 
-  /// Resolves an llvm::Value operand to its mlir::Value: an already-mapped
-  /// value (a formal arg, a PHI's block argument, or a prior instruction's
-  /// result), or materializes a gmir.constant (memoized in ValueMap) the
-  /// first time a ConstantInt is seen. Returns false if the operand can't
-  /// be represented (e.g. doesn't fit in 64 bits, isn't an integer, or is
-  /// some other unmapped/unsupported value).
-  bool getOperand(llvm::Value *V, mlir::Value &Out) {
+  /// Resolves an llvm::Value operand to its full list of leaf mlir::Values
+  /// (see ValueMap below): an already-mapped value (a formal arg, a PHI's
+  /// block argument, or a prior instruction's result -- possibly multiple
+  /// leaves for an aggregate, mirroring IRTranslator's ArrayRef<Register>-
+  /// per-Value model, since !gmir.llt has no aggregate representation), or
+  /// materializes a single-leaf gmir.constant (memoized in ValueMap) the
+  /// first time a scalar ConstantInt is seen. Returns false if the operand
+  /// can't be represented (e.g. an aggregate constant -- ConstantStruct/
+  /// ConstantArray/ConstantAggregateZero are not materialized here, only
+  /// ConstantInt is -- a ConstantInt too wide for 64 bits, or some other
+  /// unmapped/unsupported value).
+  bool getOperands(llvm::Value *V, SmallVectorImpl<mlir::Value> &Out) {
     auto It = ValueMap.find(V);
     if (It != ValueMap.end()) {
-      Out = It->second;
+      Out.append(It->second.begin(), It->second.end());
       return true;
     }
     auto *CI = dyn_cast<ConstantInt>(V);
@@ -664,8 +721,22 @@ private:
         gmir::ConstantOp::create(Builder, Builder.getUnknownLoc(), Ty,
                                  Builder.getI64IntegerAttr(CI->getSExtValue()));
     ConstantInsertPt = std::next(mlir::Block::iterator(ConstOp));
-    Out = ConstOp.getResult();
-    ValueMap[V] = Out;
+    ValueMap[V] = {ConstOp.getResult()};
+    Out.push_back(ConstOp.getResult());
+    return true;
+  }
+
+  /// Thin single-leaf convenience wrapper over getOperands, for every call
+  /// site that's structurally guaranteed non-aggregate (arithmetic/icmp
+  /// operands, branch conditions, PHI incoming values, alloca/GEP pointer
+  /// and index operands, a function's own return value -- convertType-able
+  /// types are always exactly one leaf, so this asserts via the size check
+  /// rather than silently truncating).
+  bool getScalarOperand(llvm::Value *V, mlir::Value &Out) {
+    SmallVector<mlir::Value, 1> Leaves;
+    if (!getOperands(V, Leaves) || Leaves.size() != 1)
+      return false;
+    Out = Leaves[0];
     return true;
   }
 
@@ -677,7 +748,10 @@ private:
   mlir::Block *EntryBlock = nullptr;
   mlir::Block::iterator ConstantInsertPt;
   llvm::DenseMap<BasicBlock *, mlir::Block *> BlockMap;
-  llvm::DenseMap<llvm::Value *, mlir::Value> ValueMap;
+  /// Every SSA value maps to a list of leaf mlir::Values -- almost always
+  /// exactly one, except for an aggregate-typed load result or store
+  /// value, which has one leaf per computeGMIRLeafTypes leaf.
+  llvm::DenseMap<llvm::Value *, SmallVector<mlir::Value, 1>> ValueMap;
 };
 
 } // namespace
