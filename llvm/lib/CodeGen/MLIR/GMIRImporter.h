@@ -6,11 +6,11 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Imports a single-basic-block, scalar-integer-arithmetic-only
-// llvm::Function directly into `gmir` ops, without going through MLIR's
-// `llvm` dialect: mlir::translateLLVMIRToModule takes ownership of a whole
-// llvm::Module for a one-shot translation, which doesn't fit a pass that
-// runs per-function on a Module shared with the rest of the compilation.
+// Imports an llvm::Function directly into `gmir` ops, without going
+// through MLIR's `llvm` dialect: mlir::translateLLVMIRToModule takes
+// ownership of a whole llvm::Module for a one-shot translation, which
+// doesn't fit a pass that runs per-function on a Module shared with the
+// rest of the compilation.
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,12 +24,12 @@ class Function;
 
 namespace gmir {
 
-/// Imports F's single basic block into a new mlir::func::FuncOp appended to
-/// Module, as `gmir` ops. Returns a null FuncOp -- without building
-/// anything further -- the moment F contains anything outside the
-/// currently-supported subset: more than one basic block, a non-integer
-/// type (or an integer wider than 64 bits), or an instruction opcode other
-/// than add/sub/mul/sdiv/and/or/xor/ret.
+/// Imports F into a new mlir::func::FuncOp appended to Module, as `gmir`
+/// ops. Returns a null FuncOp -- without building anything further -- the
+/// moment F contains anything outside the currently-supported subset: a
+/// non-integer type (or an integer wider than 64 bits), an unstructured
+/// terminator (e.g. `switch`, `indirectbr`), or an instruction opcode
+/// other than add/sub/mul/sdiv/and/or/xor/icmp/br/ret.
 mlir::func::FuncOp importFunction(mlir::ModuleOp Module, llvm::Function &F);
 
 } // namespace gmir

@@ -92,7 +92,8 @@ public:
     mlir::OwningOpRef<mlir::ModuleOp> Module(
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
     mlir::func::FuncOp FuncOp = gmir::importFunction(*Module, MF.getFunction());
-    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF)) {
+    const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
+    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI)) {
       // Outside the currently-supported subset, or CallLowering itself
       // declined: defer to the existing selector, same as always.
       MF.getProperties().setFailedISel();

@@ -22,3 +22,17 @@ entry:
   %r = add i128 %a, 5
   ret i128 %r
 }
+
+define i32 @switcher(i32 %x) {
+entry:
+  switch i32 %x, label %default [
+    i32 0, label %case0
+    i32 1, label %case1
+  ]
+case0:
+  ret i32 10
+case1:
+  ret i32 20
+default:
+  ret i32 30
+}

@@ -17,6 +17,7 @@
 #define LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD
 
 include "mlir/IR/OpBase.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -81,6 +82,47 @@ def GMIR_ConstantOp : GMIR_Op<"constant", [Pure, ConstantLike]> {
   let arguments = (ins I64Attr:$value);
   let results = (outs GMIR_LLTType:$res);
   let assemblyFormat = "$value attr-dict `:` type($res)";
+}
+
+def GMIR_ICmpOp : GMIR_Op<"icmp", [Pure]> {
+  let summary = "Integer comparison, mirroring GlobalISel's G_ICMP";
+  let description = [{
+    `predicate` holds the raw `llvm::CmpInst::Predicate` integer value
+    (e.g. `ICMP_EQ`, `ICMP_SLT`) -- a plain attribute rather than a new
+    MLIR enum-attr, matching `gmir.constant`'s value attribute: kept
+    simple until real need for parser/printer-level enum names arises.
+  }];
+  let arguments = (ins I64Attr:$predicate, GMIR_LLTType:$lhs, GMIR_LLTType:$rhs);
+  let results = (outs GMIR_LLTType:$res);
+}
+
+def GMIR_BrOp : GMIR_Op<"br", [Pure, Terminator,
+    DeclareOpInterfaceMethods<BranchOpInterface, ["getSuccessorForOperands"]>]> {
+  let summary = "Unconditional branch, mirroring GlobalISel's G_BR";
+  let description = [{
+    `destOperands` feed `dest`'s block arguments -- MLIR's idiom for SSA
+    values live across block boundaries (i.e. what LLVM IR represents as
+    PHI nodes in the destination block; there is no separate `gmir.phi`
+    op). Modeled directly on `cf.br` (`mlir::cf::BranchOp`).
+  }];
+  let arguments = (ins Variadic<GMIR_LLTType>:$destOperands);
+  let successors = (successor AnySuccessor:$dest);
+}
+
+def GMIR_CondBrOp : GMIR_Op<"brcond", [Pure, Terminator, AttrSizedOperandSegments,
+    DeclareOpInterfaceMethods<BranchOpInterface, ["getSuccessorForOperands"]>]> {
+  let summary = "Conditional branch, mirroring GlobalISel's G_BRCOND + G_BR";
+  let description = [{
+    Modeled directly on `cf.cond_br` (`mlir::cf::CondBranchOp`); see
+    `gmir.br` for why successor operands (here two groups, one per
+    destination) stand in for PHI nodes. `AttrSizedOperandSegments` is
+    needed because there are two variadic operand groups plus the scalar
+    `condition`.
+  }];
+  let arguments = (ins GMIR_LLTType:$condition,
+                       Variadic<GMIR_LLTType>:$trueDestOperands,
+                       Variadic<GMIR_LLTType>:$falseDestOperands);
+  let successors = (successor AnySuccessor:$trueDest, AnySuccessor:$falseDest);
 }
 
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD
