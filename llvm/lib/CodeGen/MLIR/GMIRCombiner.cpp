@@ -20,7 +20,9 @@
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/InstrTypes.h"
 #include <optional>
+#include <type_traits>
 
 using namespace llvm;
 
@@ -86,6 +88,54 @@ static std::optional<mlir::Value> matchRepeatedOperand(OpTy Op,
   }
 
   return std::nullopt;
+}
+
+// Generalizes matchRepeatedOperand above to an outer op and an
+// independently-typed inner op (matchRepeatedOperand's OuterOpTy and
+// InnerOpTy are always the same type) -- shared by XorAndDeMorganPattern
+// (Outer=XorOp, Inner=AndOp) and ICmpBinOpEqOtherPattern (Outer=ICmpOp,
+// Inner=AddOp/SubOp/XorOp) below, which both need this same "for each of
+// Op's two operands, check if it's InnerOpTy and if Op's *other* operand
+// equals one of Inner's own two operands" search, plus (unlike
+// matchRepeatedOperand's callers) the outer op's *other* operand itself,
+// to build their replacement. Returns {Inner, Other, Matched} on success,
+// where Matched is whichever of Inner's own operands Other didn't equal
+// (i.e. what Other "cancels out" against). IsCommutative controls
+// whether Inner.getRhs() is even checked as a candidate for Other -- must
+// be false for a non-commutative InnerOpTy like gmir.sub, where matching
+// that side would silently accept a different (and, for
+// ICmpBinOpEqOtherPattern's sub case, deliberately unimplemented)
+// identity. Gate lets a caller reject an otherwise-matching Inner for a
+// structural reason beyond operand equality (XorAndDeMorganPattern's
+// hasOneUse() profitability check); pass a callback that always returns
+// true if no such check is needed.
+template <typename InnerOpTy, typename OuterOpTy, typename GateTy>
+static std::optional<std::tuple<InnerOpTy, mlir::Value, mlir::Value>>
+matchOuterInnerPair(OuterOpTy Op, bool IsCommutative, GateTy Gate) {
+  for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
+    auto Inner = Cand.getDefiningOp<InnerOpTy>();
+    if (!Inner || !Gate(Inner))
+      continue;
+
+    mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
+    if (Other == Inner.getLhs())
+      return std::make_tuple(Inner, Other, Inner.getRhs());
+
+    if (IsCommutative && Other == Inner.getRhs())
+      return std::make_tuple(Inner, Other, Inner.getLhs());
+  }
+
+  return std::nullopt;
+}
+
+// Shared by every icmp pattern below -- TargetLowering.cpp's foldSetCC
+// family only ever ports the SETEQ/SETNE-gated identities to this
+// pipeline; every candidate rewrite is only sound for an equality
+// predicate. Checks against CmpInst::ICMP_EQ/ICMP_NE's raw integer
+// values directly, matching GMIR_ICmpOp's own "raw predicate integer,
+// not an enum attr" convention.
+static bool isEqualityPredicate(int64_t Pred) {
+  return Pred == CmpInst::ICMP_EQ || Pred == CmpInst::ICMP_NE;
 }
 
 namespace {
@@ -179,7 +229,12 @@ public:
 /// check in this pipeline, so this pattern deliberately generalizes to
 /// all 4 combinations (both gmir.xor operand orders x both gmir.and
 /// operand orders) rather than literally porting the single shape
-/// DAGCombiner happens to check.
+/// DAGCombiner happens to check. Shares its search skeleton with
+/// ICmpBinOpEqOtherPattern below via matchOuterInnerPair (Outer=XorOp,
+/// Inner=AndOp here) -- both need the identical "for each of Op's two
+/// operands, check InnerOpTy, check Op's other operand against Inner's
+/// own operands" shape, unlike matchRepeatedOperand's same-outer/
+/// inner-type callers above.
 class XorAndDeMorganPattern : public mlir::OpRewritePattern<gmir::XorOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
@@ -187,34 +242,25 @@ public:
   LogicalResult
   matchAndRewrite(gmir::XorOp Op,
                   mlir::PatternRewriter &Rewriter) const override {
-    for (mlir::Value Cand : {Op.getLhs(), Op.getRhs()}) {
-      auto And = Cand.getDefiningOp<gmir::AndOp>();
-      if (!And || !And.getResult().hasOneUse())
-        continue;
+    auto Match = matchOuterInnerPair<gmir::AndOp>(
+        Op, /*IsCommutative=*/true,
+        [](gmir::AndOp And) { return And.getResult().hasOneUse(); });
+    if (!Match)
+      return failure();
+    auto [And, Other, X] = *Match;
+    (void)And;
 
-      mlir::Value Other = (Cand == Op.getLhs()) ? Op.getRhs() : Op.getLhs();
-      mlir::Value X;
-      if (Other == And.getRhs())
-        X = And.getLhs();
-      else if (Other == And.getLhs())
-        X = And.getRhs();
-      else
-        continue;
-
-      auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
-      unsigned Width = DstGTy.getScalarSizeInBits();
-      mlir::Location Loc = Op.getLoc();
-      mlir::IntegerAttr NegOneAttr =
-          makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
-      auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
-      auto NotX =
-          gmir::XorOp::create(Rewriter, Loc, DstGTy, X, NegOne.getResult());
-      Rewriter.replaceOpWithNewOp<gmir::AndOp>(Op, DstGTy, NotX.getResult(),
-                                               Other);
-      return success();
-    }
-
-    return failure();
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    unsigned Width = DstGTy.getScalarSizeInBits();
+    mlir::Location Loc = Op.getLoc();
+    mlir::IntegerAttr NegOneAttr =
+        makeGMIRConstAttr(Rewriter.getContext(), APInt::getAllOnes(Width));
+    auto NegOne = gmir::ConstantOp::create(Rewriter, Loc, DstGTy, NegOneAttr);
+    auto NotX =
+        gmir::XorOp::create(Rewriter, Loc, DstGTy, X, NegOne.getResult());
+    Rewriter.replaceOpWithNewOp<gmir::AndOp>(Op, DstGTy, NotX.getResult(),
+                                             Other);
+    return success();
   }
 };
 
@@ -404,6 +450,208 @@ public:
     return success();
   }
 };
+
+/// `(X op Y) == (X op Z) -> Y == Z` for op in {add, sub, xor}
+/// (TargetLowering.cpp's foldSetCCWithBinOp family). The two "aligned"
+/// pairings (operand(0) matches operand(0), or operand(1) matches
+/// operand(1)) are checked for all three op types unconditionally; the
+/// two "swapped" pairings are checked only when IsCommutative (true for
+/// add/xor, false for sub -- gmir.sub isn't Commutative, matching
+/// TargetLowering.cpp's own isCommutativeBinOp gate on the swapped
+/// checks).
+template <typename OpTy>
+class ICmpSameBinOpPattern : public mlir::OpRewritePattern<gmir::ICmpOp> {
+  bool IsCommutative;
+
+public:
+  ICmpSameBinOpPattern(mlir::MLIRContext *Context, bool IsCommutative)
+      : OpRewritePattern(Context), IsCommutative(IsCommutative) {}
+
+  LogicalResult
+  matchAndRewrite(gmir::ICmpOp Op,
+                  mlir::PatternRewriter &Rewriter) const override {
+    if (!isEqualityPredicate(Op.getPredicateAttr().getValue().getSExtValue()))
+      return failure();
+
+    auto LhsOp = Op.getLhs().getDefiningOp<OpTy>();
+    auto RhsOp = Op.getRhs().getDefiningOp<OpTy>();
+    if (!LhsOp || !RhsOp)
+      return failure();
+
+    mlir::Value NewLhs, NewRhs;
+    if (LhsOp.getLhs() == RhsOp.getLhs()) {
+      NewLhs = LhsOp.getRhs();
+      NewRhs = RhsOp.getRhs();
+    } else if (LhsOp.getRhs() == RhsOp.getRhs()) {
+      NewLhs = LhsOp.getLhs();
+      NewRhs = RhsOp.getLhs();
+    } else if (IsCommutative && LhsOp.getLhs() == RhsOp.getRhs()) {
+      NewLhs = LhsOp.getRhs();
+      NewRhs = RhsOp.getLhs();
+    } else if (IsCommutative && LhsOp.getRhs() == RhsOp.getLhs()) {
+      NewLhs = LhsOp.getLhs();
+      NewRhs = RhsOp.getRhs();
+    } else {
+      return failure();
+    }
+
+    // gmir.icmp's result is never SameOperandsAndResultType with its
+    // operands (res is always 1-bit) -- the replacement must reuse Op's
+    // own result type, not derive one from NewLhs/NewRhs.
+    Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(
+        Op, Op.getResult().getType(), Op.getPredicateAttr(), NewLhs, NewRhs);
+    return success();
+  }
+};
+
+/// `(X op Y) cmp Z -> Y cmp 0` when Z structurally equals X, and (for
+/// add/xor only) `X cmp 0` when Z equals Y (foldSetCCWithBinOp,
+/// TargetLowering.cpp -- the X==N1 check applies to add/sub/xor alike;
+/// the Y==N1 -> X==0 check is add/xor-only -- sub's Y==N1 sibling needs
+/// a shift op gmir doesn't have, deliberately excluded here, same
+/// exclusion as DAGCombiner.cpp's own SUB-specific X==Y<<1 fallthrough).
+///
+/// Checks both gmir.icmp operand positions for being the binop (the "Z"
+/// in the identity above): TargetLowering.cpp reaches this fold from two
+/// call sites, one of which is additionally gated by a register-
+/// pressure/induction-variable profitability heuristic (a pure
+/// profitability judgment, not a correctness requirement) that gmir has
+/// no equivalent induction-variable-chain analysis to replicate. This
+/// pattern deliberately ports only the sound core identity, applied
+/// symmetrically to both icmp operand positions. Shares its search
+/// skeleton with XorAndDeMorganPattern above via matchOuterInnerPair
+/// (Outer=ICmpOp, Inner=OpTy here); IsCommutative=false for OpTy=SubOp
+/// is what excludes the Y==N1 shape for sub (matchOuterInnerPair's
+/// "Matched" side == Inner.getLhs() only, never Inner.getRhs(), when
+/// not commutative).
+template <typename OpTy>
+class ICmpBinOpEqOtherPattern : public mlir::OpRewritePattern<gmir::ICmpOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(gmir::ICmpOp Op,
+                  mlir::PatternRewriter &Rewriter) const override {
+    if (!isEqualityPredicate(Op.getPredicateAttr().getValue().getSExtValue()))
+      return failure();
+
+    auto Match = matchOuterInnerPair<OpTy>(
+        Op, /*IsCommutative=*/!std::is_same_v<OpTy, gmir::SubOp>,
+        [](OpTy) { return true; });
+    if (!Match)
+      return failure();
+    auto [BinOp, Other, Remaining] = *Match;
+    (void)Other;
+
+    auto DstGTy = cast<gmir::LLTType>(BinOp.getResult().getType());
+    mlir::IntegerAttr ZeroAttr = makeGMIRConstAttr(
+        Rewriter.getContext(), APInt::getZero(DstGTy.getScalarSizeInBits()));
+    auto Zero =
+        gmir::ConstantOp::create(Rewriter, Op.getLoc(), DstGTy, ZeroAttr);
+    Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(Op, Op.getResult().getType(),
+                                              Op.getPredicateAttr(), Remaining,
+                                              Zero.getResult());
+    return success();
+  }
+};
+
+/// `(X op C1) == C2 -> X == combine(C1, C2)` for op in {add, xor}
+/// (TargetLowering.cpp), hasOneUse()-gated on the inner op, no TLI
+/// query -- same gate class as XorAndDeMorganPattern. Outer op (ICmpOp)
+/// and inner op (OpTy) are different types, same shape as
+/// XorAndDeMorganPattern's outer-XorOp/inner-AndOp combo, not
+/// ReassociateConstOpPattern's same-op-type shape.
+template <typename OpTy>
+class ICmpConstAdjustPattern : public mlir::OpRewritePattern<gmir::ICmpOp> {
+  ConstCombinator Combine;
+
+public:
+  ICmpConstAdjustPattern(mlir::MLIRContext *Context, ConstCombinator Combine)
+      : OpRewritePattern(Context), Combine(Combine) {}
+
+  LogicalResult
+  matchAndRewrite(gmir::ICmpOp Op,
+                  mlir::PatternRewriter &Rewriter) const override {
+    if (!isEqualityPredicate(Op.getPredicateAttr().getValue().getSExtValue()))
+      return failure();
+
+    // Width comes from the compared *operands*, never Op's own 1-bit
+    // result -- the width-truncation nuance specific to icmp among every
+    // pattern in this file so far (every prior arithmetic pattern's
+    // Op.getResult().getType() coincides with its operand width; icmp's
+    // does not).
+    auto OperandGTy = cast<gmir::LLTType>(Op.getLhs().getType());
+    unsigned Width = OperandGTy.getScalarSizeInBits();
+
+    auto Outer = matchConstOperand(Op, Width);
+    if (!Outer)
+      return failure();
+    auto [OuterOther, C2] = *Outer;
+
+    auto InnerOp = OuterOther.template getDefiningOp<OpTy>();
+    if (!InnerOp || !InnerOp.getResult().hasOneUse())
+      return failure();
+
+    auto Inner = matchConstOperand(InnerOp, Width);
+    if (!Inner)
+      return failure();
+    auto [X, C1] = *Inner;
+
+    mlir::IntegerAttr NewConst =
+        makeGMIRConstAttr(Rewriter.getContext(), Combine(C1, C2));
+    auto NewC =
+        gmir::ConstantOp::create(Rewriter, Op.getLoc(), OperandGTy, NewConst);
+    Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(Op, Op.getResult().getType(),
+                                              Op.getPredicateAttr(), X,
+                                              NewC.getResult());
+    return success();
+  }
+};
+
+/// `(C1 - X) == C2 -> X == (C1 - C2)` (TargetLowering.cpp),
+/// hasOneUse()-gated. gmir.sub isn't Commutative, so C1 must
+/// specifically be the sub's LHS -- same non-commutative-specific
+/// treatment as SubMinusOneToXorPattern above (matchConstOperand's
+/// dual-order peel would wrongly also match sub(X, C1), a completely
+/// different value).
+class ICmpSubConstPattern : public mlir::OpRewritePattern<gmir::ICmpOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult
+  matchAndRewrite(gmir::ICmpOp Op,
+                  mlir::PatternRewriter &Rewriter) const override {
+    if (!isEqualityPredicate(Op.getPredicateAttr().getValue().getSExtValue()))
+      return failure();
+
+    auto OperandGTy = cast<gmir::LLTType>(Op.getLhs().getType());
+    unsigned Width = OperandGTy.getScalarSizeInBits();
+
+    auto Outer = matchConstOperand(Op, Width);
+    if (!Outer)
+      return failure();
+    auto [OuterOther, C2] = *Outer;
+
+    auto InnerSub = OuterOther.getDefiningOp<gmir::SubOp>();
+    if (!InnerSub || !InnerSub.getResult().hasOneUse())
+      return failure();
+
+    mlir::IntegerAttr C;
+    if (!matchPattern(InnerSub.getLhs(), m_Constant(&C)))
+      return failure();
+    APInt C1 = C.getValue().trunc(Width);
+    mlir::Value X = InnerSub.getRhs();
+
+    mlir::IntegerAttr NewConst =
+        makeGMIRConstAttr(Rewriter.getContext(), C1 - C2);
+    auto NewC =
+        gmir::ConstantOp::create(Rewriter, Op.getLoc(), OperandGTy, NewConst);
+    Rewriter.replaceOpWithNewOp<gmir::ICmpOp>(Op, Op.getResult().getType(),
+                                              Op.getPredicateAttr(), X,
+                                              NewC.getResult());
+    return success();
+  }
+};
 } // namespace
 
 const mlir::FrozenRewritePatternSet &
@@ -434,6 +682,22 @@ gmir::CombinerPatternCache::get(mlir::MLIRContext &Context,
   Patterns.add<RepeatedOperandIdempotentPattern<gmir::AndOp>>(&Context);
   Patterns.add<RepeatedOperandIdempotentPattern<gmir::OrOp>>(&Context);
   Patterns.add<XorSelfCancelPattern>(&Context);
+
+  // gmir.icmp's first combiner coverage.
+  Patterns.add<ICmpSameBinOpPattern<gmir::AddOp>>(&Context,
+                                                  /*IsCommutative=*/true);
+  Patterns.add<ICmpSameBinOpPattern<gmir::SubOp>>(&Context,
+                                                  /*IsCommutative=*/false);
+  Patterns.add<ICmpSameBinOpPattern<gmir::XorOp>>(&Context,
+                                                  /*IsCommutative=*/true);
+  Patterns.add<ICmpBinOpEqOtherPattern<gmir::AddOp>>(&Context);
+  Patterns.add<ICmpBinOpEqOtherPattern<gmir::SubOp>>(&Context);
+  Patterns.add<ICmpBinOpEqOtherPattern<gmir::XorOp>>(&Context);
+  Patterns.add<ICmpConstAdjustPattern<gmir::AddOp>>(
+      &Context, +[](const APInt &C1, const APInt &C2) { return C2 - C1; });
+  Patterns.add<ICmpConstAdjustPattern<gmir::XorOp>>(
+      &Context, +[](const APInt &C1, const APInt &C2) { return C1 ^ C2; });
+  Patterns.add<ICmpSubConstPattern>(&Context);
 
   return Cache.try_emplace(Key, std::move(Patterns)).first->second;
 }
