@@ -24,6 +24,7 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_llvm_unittest(MLIRCodeGenTests
+  GMIRCombinerTest.cpp
   GMIRImporterTest.cpp
   GMIRLegalizerTest.cpp
   GMIRLLTConversionTest.cpp

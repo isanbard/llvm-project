@@ -12,15 +12,21 @@
 // arithmetic ops' own fold() methods (see IR/GMIRDialect.cpp), not as
 // patterns registered here -- fold() fires automatically wherever
 // applyPatternsGreedily runs, which is all this pass needs to do to
-// exercise them. This file's own job is just (a) providing the pipeline
-// slot those fold()s actually run in, and (b) wiring in CSE
+// exercise them. This file's own job is (a) providing the pipeline slot
+// those fold()s actually run in, (b) wiring in CSE
 // (mlir::eliminateCommonSubExpressions), a distinct, complementary
 // simplification fold() can't do on its own (deduping genuinely-
 // different-looking-but-equivalent ops, not reducing a single op given
-// its own operands). A rule needing a genuine multi-op rewrite (which
-// fold() can't express -- no new ops, no restructuring) registers a real
-// pattern into CombinerPatternCache instead, the same OpRewritePattern<OpTy>
-// shape GMIRLegalizer.h uses.
+// its own operands), (c) hosting genuine multi-op rewrites fold() can't
+// express -- no new ops, no restructuring -- as real OpRewritePattern<OpTy>
+// classes registered into CombinerPatternCache, the same shape
+// GMIRLegalizer.h uses (e.g. MulNegOneToSubPattern: `mul x, -1 ->
+// sub(0, x)`, which needs a brand-new gmir.sub op fold() can't emit), and
+// (d) hosting patterns gated on a genuine TargetLowering query (via
+// GMIRTargetLoweringAdapter in GMIRCombiner.cpp, the same shape
+// GMIRLegalizerInfoAdapter wraps LegalizerInfo in GMIRLegalizer.cpp) --
+// e.g. DisjointAddToOrPattern: `add(and(a,C1), and(b,C2)) -> or(...)`
+// when the masks are disjoint and TLI reports OR legal.
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,35 +35,67 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Rewrite/FrozenRewritePatternSet.h"
-#include <optional>
+#include "llvm/ADT/DenseMap.h"
+#include <tuple>
 
 namespace llvm {
+class DataLayout;
+class LLVMContext;
+class MachineFunction;
+class TargetLowering;
+
 namespace gmir {
 
-/// Caches the FrozenRewritePatternSet gmir::combine() applies, built once
-/// and reused for the pass instance's lifetime. Unlike GMIRLegalizer.h's
-/// LegalizerPatternCache, this needs no per-target keying: the tier-1
-/// fold()-based identities have no LegalizerInfo/DataLayout dependency at
-/// all, and a pattern that genuinely needs a TargetLowering query is
-/// expected to call it directly from the pattern body (the same way
-/// GMIRLegalizerInfoAdapter wraps LegalizerInfo), not by keying the whole
-/// pattern set on it.
+/// Caches the FrozenRewritePatternSet gmir::combine() applies, keyed by
+/// (TargetLowering, DataLayout, LLVMContext) -- same shape and same
+/// rationale as GMIRLegalizer.h's LegalizerPatternCache (see its doc
+/// comment for the full argument for why more than just TargetLowering
+/// needs to be part of the key), plus LLVMContext specifically because
+/// DisjointAddToOrPattern (GMIRCombiner.cpp) captures an `LLVMContext &`
+/// at cache-population time and reuses it on every later
+/// matchAndRewrite call -- unlike LegalizerInfo/DataLayout, whose
+/// lifetimes track the TargetSubtargetInfo, an LLVMContext's lifetime
+/// tracks the Module being compiled. Omitting it from the key would let
+/// a stale cache hit (same TLI/DL pointers, reused for a different
+/// Module/LLVMContext in a long-lived embedding that recompiles multiple
+/// Modules) hand back a pattern set holding a dangling context
+/// reference. Meant to be owned as long-lived state by the caller (e.g.
+/// a MachineFunctionPass member), safe to cache across functions for the
+/// same reason LegalizerPatternCache is: the patterns' captured
+/// MLIRContext*/DataLayout&/TargetLowering*/LLVMContext& are all owned
+/// by the Module/TargetSubtargetInfo, which outlive any single
+/// MachineFunctionPass invocation -- just not across a Module boundary,
+/// which the key accounts for.
 class CombinerPatternCache {
 public:
-  const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context);
+  // Ctx (the LLVM IR LLVMContext, distinct from the mlir::MLIRContext
+  // Context parameter) is only used to build the patterns on a cache
+  // miss -- like Context itself, it's a per-call parameter, but (unlike
+  // Context) also part of the cache key, for the reason above.
+  const mlir::FrozenRewritePatternSet &get(mlir::MLIRContext &Context,
+                                           const TargetLowering *TLI,
+                                           const llvm::DataLayout &DL,
+                                           llvm::LLVMContext &Ctx);
 
 private:
-  std::optional<mlir::FrozenRewritePatternSet> Cache;
+  llvm::DenseMap<std::tuple<const TargetLowering *, const llvm::DataLayout *,
+                            const llvm::LLVMContext *>,
+                 mlir::FrozenRewritePatternSet>
+      Cache;
 };
 
-/// Rewrites FuncOp in place: applies PatternCache's patterns via
-/// applyPatternsGreedily (this is what exercises the arithmetic ops' own
-/// fold()s, see IR/GMIRDialect.cpp, regardless of whether any pattern is
-/// actually registered), then runs CSE once. Returns false only if
-/// applyPatternsGreedily itself fails (e.g. non-convergence) -- mirrors
-/// gmir::legalize()'s fallible-step convention used throughout this
-/// pipeline's caller, MLIRInstructionSelect.cpp.
-bool combine(mlir::func::FuncOp FuncOp, CombinerPatternCache &PatternCache);
+/// Rewrites FuncOp in place: applies PatternCache's patterns (plus, for
+/// every op, its own fold() -- the greedy driver invokes fold()
+/// unconditionally regardless of what's in the pattern set, see
+/// IR/GMIRDialect.cpp) via applyPatternsGreedily, then runs CSE once.
+/// Returns false only if applyPatternsGreedily itself fails (e.g.
+/// non-convergence) -- mirrors gmir::legalize()'s fallible-step
+/// convention used throughout this pipeline's caller,
+/// MLIRInstructionSelect.cpp. MF supplies the real TargetLowering/
+/// DataLayout/LLVMContext some patterns need to query, the same way
+/// gmir::legalize() uses it for LegalizerInfo.
+bool combine(mlir::func::FuncOp FuncOp, MachineFunction &MF,
+             CombinerPatternCache &PatternCache);
 
 } // namespace gmir
 } // namespace llvm

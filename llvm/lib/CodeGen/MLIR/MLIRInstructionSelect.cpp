@@ -143,7 +143,7 @@ public:
       llvm::errs() << '\n';
     }
 
-    if (!gmir::combine(FuncOp, CombinerCache)) {
+    if (!gmir::combine(FuncOp, MF, CombinerCache)) {
       MF.getProperties().setFailedISel();
       return false;
     }
