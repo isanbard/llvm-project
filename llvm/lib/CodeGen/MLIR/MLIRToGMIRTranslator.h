@@ -17,6 +17,7 @@
 #ifndef LLVM_CODEGEN_MLIR_MLIRTOGMIRTRANSLATOR_H
 #define LLVM_CODEGEN_MLIR_MLIRTOGMIRTRANSLATOR_H
 
+#include "GMIRImporter.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace llvm {
@@ -43,11 +44,15 @@ namespace gmir {
 /// deduplicated input the way IRTranslator always produces it -- e.g. a
 /// multi-index GEP's constant-offset gmir.ptr_add chain selected a
 /// different (but semantically equivalent) AArch64 addressing mode
-/// without this. Returns false if the target has no CallLowering
+/// without this. CallInsts is importFunction's own output (see
+/// CallInstMap's doc comment in GMIRImporter.h): translateCall looks up
+/// each gmir.call's original llvm::CallInst there instead of anywhere in
+/// FuncOp itself. Returns false if the target has no CallLowering
 /// implementation, or CallLowering itself declines -- the caller should
 /// treat that the same as an unsupported import: fall back gracefully.
 bool translate(mlir::func::FuncOp FuncOp, Function &F, MachineFunction &MF,
-               const BranchProbabilityInfo &BPI, MachineIRBuilder &MIRBuilder);
+               const BranchProbabilityInfo &BPI, MachineIRBuilder &MIRBuilder,
+               const CallInstMap &CallInsts);
 
 } // namespace gmir
 } // namespace llvm

@@ -208,4 +208,46 @@ def GMIR_PtrAddOp : GMIR_Op<"ptr_add", [Pure]> {
   let results = (outs GMIR_LLTType:$res); // always a pointer LLT
 }
 
+def GMIR_CallOp : GMIR_Op<"call"> {
+  let summary = "Direct call, bridging to CallLowering::lowerCall";
+  let description = [{
+    Direct calls only (no indirect callee, no varargs, no tail/musttail, no
+    byval/sret/inalloca/preallocated/byref/swifterror/swiftself/swiftasync,
+    no operand bundles, not an intrinsic/inline-asm/GC statepoint call --
+    see GMIRImporter.cpp's importCall for the exact bail-out list).
+    `callingConv` is a descriptive attribute reconstructed from the
+    original llvm::CallBase at import time for self-description -- it is
+    NOT this op's translation source of truth. MLIRToGMIRTranslator instead
+    recovers the original llvm::CallInst* from GMIRImporter's CallInstMap
+    (populated at import time; see importCall) and calls
+    CallLowering::lowerCall's CallBase-taking overload directly on it,
+    reusing its argument-flag derivation, tail-call-eligibility
+    recomputation, and sret-demotion logic wholesale rather than
+    re-deriving llvm::ISD::ArgFlagsTy bits by hand from IR Attributes -- see
+    MLIRToGMIRTranslator.cpp's translateCall for the full rationale. There
+    is deliberately no `callee` attribute naming the original IR callee:
+    since it would carry no translation weight either (same
+    not-source-of-truth reasoning as `callingConv`), the only cost of
+    having one would be interning a FlatSymbolRefAttr per call site into
+    the MLIRContext for the life of the whole module compilation, for a
+    value nothing ever reads back -- see MLIRInstructionSelect.cpp's
+    Context doc comment for why permanent per-callsite growth like that
+    matters here specifically. Also deliberately does NOT implement
+    CallOpInterface/SymbolUserOpInterface: even a `callee` attribute
+    generally would not name a sibling func.FuncOp in this module
+    (GMIRImporter only ever imports the one function currently being
+    compiled, never its callees), so treating one as a verifier-resolved
+    module symbol would be incorrect, unlike mlir::func::CallOp's usual
+    contract.
+    `argLeafCounts[i]` gives the number of leaf `args` operands contributed
+    by original IR argument `i` (parallel to computeGMIRLeafTypes'
+    flattening of that argument's type), letting the translator regroup the
+    flat `args` operand list back into the ArrayRef<ArrayRef<Register>>
+    shape CallBase-based lowerCall's ArgRegs parameter expects.
+  }];
+  let arguments = (ins I64Attr:$callingConv, Variadic<GMIR_LLTType>:$args,
+                       DenseI32ArrayAttr:$argLeafCounts);
+  let results = (outs Optional<GMIR_LLTType>:$result);
+}
+
 #endif // LLVM_CODEGEN_MLIR_IR_GMIRDIALECT_TD

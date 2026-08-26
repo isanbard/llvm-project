@@ -3,9 +3,9 @@
 ; RUN: diff %t.normal.s %t.mlir.s
 ;
 ; Verifies the fallback path for functions genuinely outside the currently-
-; supported subset (a call, a switch, and a dynamic-size alloca; see
+; supported subset (a switch, and a dynamic-size alloca; see
 ; llvm/lib/CodeGen/MLIR/GMIRImporter.cpp, whose per-instruction dispatch has
-; no case for calls/switches, and whose importAlloca bails on
+; no case for switches, and whose importAlloca bails on
 ; !AllocaInst::isStaticAlloca()). -enable-mlir-isel must produce
 ; byte-identical output to a normal llc invocation here in every build
 ; configuration:
@@ -17,8 +17,10 @@
 ;    ResetMachineFunctionPass + SelectionDAG path GlobalISel uses.
 ;
 ; (Straight-line scalar arithmetic, structured if/else/loop control flow,
-; and static-alloca/load/store are genuinely translated instead of always
-; falling back; see scalar-arith.ll, control-flow.ll, and memory-ops.ll.)
+; static-alloca/load/store, GEP, aggregate load/store, and direct calls
+; (of the shapes importCall accepts) are genuinely translated instead of
+; always falling back; see scalar-arith.ll, control-flow.ll, memory-ops.ll,
+; gep.ll, aggregate-memops.ll, and call.ll.)
 ;
 ; @huge_alloca covers importAlloca's int64 overflow guard: an allocation
 ; size at or above 2^63 doesn't overflow the uint64_t byte-count
@@ -37,13 +39,10 @@
 ; load/store bails cleanly rather than partially emitting ops for the
 ; leaves it could handle (see aggregate-memops.ll for the genuinely-
 ; translated aggregate load/store cases).
-
-declare i32 @callee(i32)
-
-define i32 @calls_something(i32 %a) {
-  %r = call i32 @callee(i32 %a)
-  ret i32 %r
-}
+;
+; @indirect_call and @vararg_call cover two of importCall's bail-out
+; conditions (see call.ll for the genuinely-translated call cases): an
+; indirect callee, and a variadic call.
 
 ; Regression test: convertType (GMIRImporter.cpp) caps integer bit width at
 ; 64 -- gmir.constant always stores its value in a 64-bit attribute, so a
@@ -104,4 +103,18 @@ entry:
   %s = load {i32, float}, ptr %src
   store {i32, float} %s, ptr %dst
   ret void
+}
+
+define i32 @indirect_call(ptr %fp, i32 %a) {
+entry:
+  %r = call i32 %fp(i32 %a)
+  ret i32 %r
+}
+
+declare i32 @vararg_callee(i32, ...)
+
+define i32 @vararg_call(i32 %a, i32 %b) {
+entry:
+  %r = call i32 (i32, ...) @vararg_callee(i32 %a, i32 %b)
+  ret i32 %r
 }

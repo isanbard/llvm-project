@@ -18,17 +18,34 @@
 #define LLVM_CODEGEN_MLIR_GMIRIMPORTER_H
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace llvm {
+class CallInst;
 class Function;
 
 namespace gmir {
 
+/// Maps each imported gmir.call Operation back to the original
+/// llvm::CallInst it came from. MLIRToGMIRTranslator needs the original
+/// CallInst to reuse CallLowering::lowerCall's CallBase-taking overload
+/// (see gmir.call's doc comment in GMIRDialect.td) -- kept in a plain
+/// caller-owned map rather than on the op itself (e.g. via
+/// mlir::OpaqueLoc) so this per-call-site bookkeeping doesn't permanently
+/// intern anything into the MLIRContext: the map lives and dies with the
+/// caller's own per-MachineFunction state, while anything interned into
+/// the Context lives for the whole pass instance's lifetime (see
+/// MLIRInstructionSelect.cpp's Context doc comment).
+using CallInstMap = llvm::DenseMap<mlir::Operation *, llvm::CallInst *>;
+
 /// Imports F into a new mlir::func::FuncOp appended to Module, as `gmir`
-/// ops. Returns a null FuncOp -- without building anything further -- the
-/// moment F contains anything outside the currently-supported subset (see
-/// GMIRImporter.cpp's per-instruction dispatch for the exact list).
-mlir::func::FuncOp importFunction(mlir::ModuleOp Module, llvm::Function &F);
+/// ops, recording each imported gmir.call's original llvm::CallInst into
+/// CallInsts (see CallInstMap's doc comment). Returns a null FuncOp --
+/// without building anything further -- the moment F contains anything
+/// outside the currently-supported subset (see GMIRImporter.cpp's
+/// per-instruction dispatch for the exact list).
+mlir::func::FuncOp importFunction(mlir::ModuleOp Module, llvm::Function &F,
+                                  CallInstMap &CallInsts);
 
 } // namespace gmir
 } // namespace llvm

@@ -8,6 +8,7 @@
 
 #include "MLIRToGMIRTranslator.h"
 #include "IR/GMIRDialect.h"
+#include "mlir/IR/Location.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
@@ -54,9 +55,10 @@ namespace {
 class GMIRToMIRWalker {
 public:
   GMIRToMIRWalker(MachineFunction &MF, MachineIRBuilder &MIRBuilder,
-                  const CallLowering &CLI, const BranchProbabilityInfo &BPI)
+                  const CallLowering &CLI, const BranchProbabilityInfo &BPI,
+                  const gmir::CallInstMap &CallInsts)
       : MF(MF), MIRBuilder(MIRBuilder), CLI(CLI), BPI(BPI),
-        DL(MF.getDataLayout()) {}
+        DL(MF.getDataLayout()), CallInsts(CallInsts) {}
 
   bool run(mlir::func::FuncOp FuncOp, Function &F,
            FunctionLoweringInfo &FuncInfo) {
@@ -325,9 +327,79 @@ private:
       return true;
     }
 
+    if (auto Call = dyn_cast<gmir::CallOp>(&Op))
+      return translateCall(Call);
+
     // GMIRImporter only ever emits the ops handled above (plus
     // func::ReturnOp/gmir.br/gmir.brcond, handled directly in run()).
     return false;
+  }
+
+  /// Translates gmir.call by recovering the original llvm::CallInst from
+  /// CallInsts (populated at import time -- see GMIRImporter.cpp's
+  /// importCall) and calling CallLowering::lowerCall's CallBase-taking
+  /// overload directly on it, rather than hand-building a
+  /// CallLoweringInfo -- see GMIRDialect.td's gmir.call doc comment for
+  /// why: that overload already derives argument flags from IR
+  /// Attributes, recomputes tail-call eligibility, and handles
+  /// sret-demotion, all logic worth reusing rather than duplicating. The
+  /// zero/nullopt/unreachable arguments below are each provably unused
+  /// given importCall's bail-out list: no swifterror, no ptrauth bundle,
+  /// no convergencectrl bundle, and the callee is always direct (so
+  /// GetCalleeReg is never actually invoked).
+  bool translateCall(gmir::CallOp Call) {
+    auto *CI = CallInsts.lookup(Call.getOperation());
+    // Every gmir.call GMIRImporter ever produces carries an entry by
+    // construction (see importCall), so this "should" always be non-null
+    // -- but unlike everywhere else in this file that assumes an
+    // invariant impossible to violate today, a future legalizer pattern
+    // or rewriter helper cloning/rebuilding a gmir.call could plausibly
+    // produce one CallInsts never learns about. A real check-and-bail
+    // costs nothing here and keeps this path inside the same "never
+    // crash, always fall back gracefully" discipline every other
+    // unsupported-construct path in this file follows.
+    if (!CI)
+      return false;
+
+    SmallVector<Register, 1> ResRegs;
+    if (Call.getNumResults() == 1) {
+      LLT Ty = convertLLT(cast<gmir::LLTType>(Call.getResult().getType()), DL);
+      ResRegs.push_back(MIRBuilder.getMRI()->createGenericVirtualRegister(Ty));
+    }
+
+    // Regroup the flat leaf-operand list back into one ArrayRef<Register>
+    // per original IR argument, using argLeafCounts. CallArgRegStorage
+    // provides one flat, stable backing store for every ArgRegs slice --
+    // all leaf registers are pushed up front (reserve()'d to their exact
+    // final count, so no reallocation ever occurs mid-loop), then ArgRegs
+    // is built as a second pass of non-overlapping slices into it. Unlike
+    // a vector-of-vectors, there's no inner SmallVector whose own
+    // relocation could dangle an already-captured ArrayRef<Register>.
+    SmallVector<Register, 8> CallArgRegStorage;
+    CallArgRegStorage.reserve(Call.getArgs().size());
+    for (mlir::Value Arg : Call.getArgs())
+      CallArgRegStorage.push_back(ValueToReg.lookup(Arg));
+
+    SmallVector<ArrayRef<Register>, 8> ArgRegs;
+    unsigned FlatIdx = 0;
+    for (int32_t Count : Call.getArgLeafCounts()) {
+      ArgRegs.push_back(
+          ArrayRef<Register>(CallArgRegStorage).slice(FlatIdx, Count));
+      FlatIdx += Count;
+    }
+
+    if (!CLI.lowerCall(
+            MIRBuilder, *CI, ResRegs, ArgRegs, /*SwiftErrorVReg=*/Register(),
+            /*PAI=*/std::nullopt, /*ConvergenceCtrlToken=*/Register(),
+            /*GetCalleeReg=*/[]() -> Register {
+              llvm_unreachable("gmir.call is always a direct call in this "
+                               "subset -- see importCall's bail-out list");
+            }))
+      return false;
+
+    if (Call.getNumResults() == 1)
+      ValueToReg[Call.getResult()] = ResRegs[0];
+    return true;
   }
 
   /// Shared MMO construction for gmir.load/gmir.store. MOInvariant/
@@ -360,6 +432,7 @@ private:
   const CallLowering &CLI;
   const BranchProbabilityInfo &BPI;
   const llvm::DataLayout &DL;
+  const gmir::CallInstMap &CallInsts;
   llvm::DenseMap<mlir::Value, Register> ValueToReg;
   llvm::DenseMap<mlir::Block *, MachineBasicBlock *> BlockMap;
   llvm::DenseMap<mlir::Block *, SmallVector<MachineInstr *, 4>> SkeletonPhis;
@@ -369,7 +442,8 @@ private:
 
 bool gmir::translate(mlir::func::FuncOp FuncOp, Function &F,
                      MachineFunction &MF, const BranchProbabilityInfo &BPI,
-                     MachineIRBuilder &MIRBuilder) {
+                     MachineIRBuilder &MIRBuilder,
+                     const CallInstMap &CallInsts) {
   const CallLowering *CLI = MF.getSubtarget().getCallLowering();
   // getCallLowering() defaults to nullptr (TargetSubtargetInfo's base
   // implementation) and isn't overridden by every in-tree target (e.g.
@@ -390,5 +464,6 @@ bool gmir::translate(mlir::func::FuncOp FuncOp, Function &F,
   FuncInfo.BPI = nullptr;
   FuncInfo.CanLowerReturn = CLI->checkReturnTypeForCallConv(MF);
 
-  return GMIRToMIRWalker(MF, MIRBuilder, *CLI, BPI).run(FuncOp, F, FuncInfo);
+  return GMIRToMIRWalker(MF, MIRBuilder, *CLI, BPI, CallInsts)
+      .run(FuncOp, F, FuncInfo);
 }

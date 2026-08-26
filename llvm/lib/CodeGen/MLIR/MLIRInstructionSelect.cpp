@@ -92,7 +92,9 @@ public:
 
     mlir::OwningOpRef<mlir::ModuleOp> Module(
         mlir::ModuleOp::create(mlir::UnknownLoc::get(&Context)));
-    mlir::func::FuncOp FuncOp = gmir::importFunction(*Module, MF.getFunction());
+    gmir::CallInstMap CallInsts;
+    mlir::func::FuncOp FuncOp =
+        gmir::importFunction(*Module, MF.getFunction(), CallInsts);
     const auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
 
     // Match IRTranslatorLegacy::runOnMachineFunction's own choice of
@@ -107,8 +109,8 @@ public:
     GISelCSEInfo *CSEInfo = &Wrapper.get(TPC.getCSEConfig());
     std::unique_ptr<MachineIRBuilder> Builder = createMIRBuilder(MF, CSEInfo);
 
-    if (!FuncOp ||
-        !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder)) {
+    if (!FuncOp || !gmir::translate(FuncOp, MF.getFunction(), MF, BPI, *Builder,
+                                    CallInsts)) {
       // Outside the currently-supported subset, or CallLowering itself
       // declined: defer to the existing selector, same as always.
       MF.getProperties().setFailedISel();
