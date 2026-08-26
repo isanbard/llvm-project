@@ -25,11 +25,11 @@
 #include "llvm/CodeGen/CodeGenCommonISel.h"
 #include "llvm/CodeGen/FunctionLoweringInfo.h"
 #include "llvm/CodeGen/GlobalISel/CSEInfo.h"
-#include "llvm/CodeGen/GlobalISel/CSEMIRBuilder.h"
 #include "llvm/CodeGen/GlobalISel/CallLowering.h"
 #include "llvm/CodeGen/GlobalISel/GISelChangeObserver.h"
 #include "llvm/CodeGen/GlobalISel/InlineAsmLowering.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
+#include "llvm/CodeGen/GlobalISel/Utils.h"
 #include "llvm/CodeGen/LowLevelTypeUtils.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
@@ -5021,16 +5021,14 @@ bool IRTranslatorImpl::runOnMachineFunction(
   const TargetSubtargetInfo &Subtarget = MF->getSubtarget();
   TLI = Subtarget.getTargetLowering();
 
-  if (EnableCSE) {
-    EntryBuilder = std::make_unique<CSEMIRBuilder>(CurMF);
+  if (EnableCSE)
     CSEInfo = GetCSEInfo();
-    EntryBuilder->setCSEInfo(CSEInfo);
-    CurBuilder = std::make_unique<CSEMIRBuilder>(CurMF);
-    CurBuilder->setCSEInfo(CSEInfo);
-  } else {
-    EntryBuilder = std::make_unique<MachineIRBuilder>();
-    CurBuilder = std::make_unique<MachineIRBuilder>();
-  }
+  // createMIRBuilder is shared with the experimental MLIR-based ISel path
+  // (MLIRInstructionSelect.cpp), which needs the identical "CSEMIRBuilder
+  // wired to a shared CSEInfo, or a plain MachineIRBuilder" construction;
+  // the EnableCSE decision itself stays local to this function.
+  EntryBuilder = createMIRBuilder(CurMF, CSEInfo);
+  CurBuilder = createMIRBuilder(CurMF, CSEInfo);
   CLI = Subtarget.getCallLowering();
   CurBuilder->setMF(*MF);
   EntryBuilder->setMF(*MF);

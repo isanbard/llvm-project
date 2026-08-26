@@ -25,6 +25,7 @@
 #include "llvm/Support/Compiler.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace llvm {
@@ -33,6 +34,7 @@ class AnalysisUsage;
 class LostDebugLocObserver;
 class MachineBasicBlock;
 class BlockFrequencyInfo;
+class GISelCSEInfo;
 class GISelValueTracking;
 class MachineFunction;
 class MachineInstr;
@@ -302,6 +304,16 @@ T *getOpcodeDef(Register Reg, const MachineRegisterInfo &MRI) {
 /// Modify analysis usage so it preserves passes required for the SelectionDAG
 /// fallback.
 LLVM_ABI void getSelectionDAGFallbackAnalysisUsage(AnalysisUsage &AU);
+
+/// Constructs a MachineIRBuilder for MF: a CSEMIRBuilder wired to CSEInfo if
+/// CSEInfo is non-null, or a plain MachineIRBuilder otherwise. Callers
+/// decide whether/how to enable CSE and look up their own CSEInfo (e.g. via
+/// a GISelCSEAnalysisWrapperPass query) and pass the result (or null) in;
+/// this only covers the "which builder subclass, and how is it wired up"
+/// mechanics common to every such caller -- shared so IRTranslator and the
+/// experimental MLIR-based ISel path can't drift apart on it.
+LLVM_ABI std::unique_ptr<MachineIRBuilder>
+createMIRBuilder(MachineFunction &MF, GISelCSEInfo *CSEInfo);
 
 LLVM_ABI std::optional<APInt> ConstantFoldBinOp(unsigned Opcode,
                                                 const Register Op1,
