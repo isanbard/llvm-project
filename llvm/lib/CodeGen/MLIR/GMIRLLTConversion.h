@@ -38,8 +38,16 @@ namespace gmir {
 // silently produces ANY_SCALAR operands that AArch64's InstructionSelect
 // tablegen patterns don't match (they require isInteger() specifically)
 // while X86's happened to be permissive enough not to care -- every gmir
-// integer value must use LLT::integer(), not LLT::scalar().
+// integer value must use LLT::integer(), not LLT::scalar(). The same trap
+// applies to the fixed-width-vector case below: LLT::fixed_vector(unsigned,
+// unsigned) internally calls LLT::scalar() for its element type, producing
+// the generic Kind::VECTOR_ANY -- always use the `LLT ScalarTy`-taking
+// overload with an explicit LLT::integer(N) element type instead.
 inline LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
+  if (Ty.getNumElements() != 0)
+    return LLT::vector(
+        ElementCount::get(Ty.getNumElements(), Ty.getIsScalable()),
+        LLT::integer(Ty.getScalarSizeInBits()));
   if (Ty.getScalarSizeInBits() == 0)
     return LLT::pointer(Ty.getAddressSpace(),
                         DL.getPointerSizeInBits(Ty.getAddressSpace()));
@@ -49,10 +57,23 @@ inline LLT convertLLT(gmir::LLTType Ty, const llvm::DataLayout &DL) {
 /// Inverse of convertLLT: builds the !gmir.llt a real LLT would round-trip
 /// to. Used by GMIRLegalizer.cpp to turn a target LegalizerInfo's LLT-typed
 /// answer (e.g. NarrowScalar's LegalizeActionStep::NewType) back into a
-/// !gmir.llt for building new gmir ops. Only scalar/pointer LLTs occur here
-/// (mirrors convertLLT's own scope) -- vectors are out of scope for the
-/// whole gmir dialect so far.
+/// !gmir.llt for building new gmir ops. Propagates the scalable bit even
+/// though no current caller produces a scalable Ty (there's no parser
+/// entry point for hand-authored gmir text, and every import-side LLT --
+/// see convertType in GMIRImporter.cpp -- is already fixed-width): a
+/// LegalizerInfo's NewType is queried from the target's own rules, not
+/// hand-restricted to what this pipeline happens to produce today, so
+/// silently hardcoding non-scalable here would be a latent trap for
+/// whichever future gmir producer first feeds in a scalable type, not a
+/// simplification of the currently-reachable cases. Vector-of-pointer
+/// stays out of scope for the whole gmir dialect, matching convertType's
+/// import-side scope.
 inline gmir::LLTType convertToGMIRType(mlir::MLIRContext &Context, LLT Ty) {
+  if (Ty.isVector())
+    return gmir::LLTType::get(&Context, Ty.getScalarSizeInBits(),
+                              Ty.getElementCount().getKnownMinValue(),
+                              /*addressSpace=*/0,
+                              Ty.getElementCount().isScalable());
   if (Ty.isPointer())
     return gmir::LLTType::get(&Context, /*scalarSizeInBits=*/0,
                               /*numElements=*/0, Ty.getAddressSpace(),

@@ -124,8 +124,10 @@ private:
   bool lowerFormalArguments(mlir::func::FuncOp FuncOp, Function &F,
                             FunctionLoweringInfo &FuncInfo) {
     // Stable storage for the ArrayRef<Register>s CallLowering expects --
-    // one single-element vector per argument (no multi-register/aggregate
-    // args in the current scalar-integer-only subset).
+    // one single-element vector per argument (aggregate-typed arguments
+    // are out of scope, same as everywhere else in this importer/
+    // translator pair; a scalar, pointer, or fixed-width vector argument
+    // is always exactly one leaf, never split here).
     mlir::Block &EntryBB = FuncOp.getFunctionBody().front();
     ArgRegStorage.reserve(EntryBB.getNumArguments());
     SmallVector<ArrayRef<Register>, 8> VRegArgs;
@@ -292,6 +294,7 @@ private:
     GMIR_BINOP_CASE(AddOp, MIRBuilder.buildAdd(Ty, LHS, RHS))
     GMIR_BINOP_CASE(SubOp, MIRBuilder.buildSub(Ty, LHS, RHS))
     GMIR_BINOP_CASE(MulOp, MIRBuilder.buildMul(Ty, LHS, RHS))
+    GMIR_BINOP_CASE(UMulHOp, MIRBuilder.buildUMulH(Ty, LHS, RHS))
     GMIR_BINOP_CASE(AndOp, MIRBuilder.buildAnd(Ty, LHS, RHS))
     GMIR_BINOP_CASE(OrOp, MIRBuilder.buildOr(Ty, LHS, RHS))
     GMIR_BINOP_CASE(XorOp, MIRBuilder.buildXor(Ty, LHS, RHS))
@@ -348,6 +351,18 @@ private:
       Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
       MIRBuilder.buildMergeValues(Res, SrcRegs);
       ValueToReg[Merge.getResult()] = Res;
+      return true;
+    }
+
+    if (auto BuildVector = dyn_cast<gmir::BuildVectorOp>(&Op)) {
+      SmallVector<Register, 4> SrcRegs;
+      for (mlir::Value Src : BuildVector.getSrcs())
+        SrcRegs.push_back(ValueToReg.lookup(Src));
+      LLT Ty = convertLLT(
+          cast<gmir::LLTType>(BuildVector.getResult().getType()), DL);
+      Register Res = MIRBuilder.getMRI()->createGenericVirtualRegister(Ty);
+      MIRBuilder.buildBuildVector(Res, SrcRegs);
+      ValueToReg[BuildVector.getResult()] = Res;
       return true;
     }
 

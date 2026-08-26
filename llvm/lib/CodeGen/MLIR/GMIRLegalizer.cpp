@@ -174,6 +174,49 @@ void rewriteWidenScalar(OpTy Op, mlir::PatternRewriter &Rewriter, LLT WideTy) {
   Rewriter.replaceOpWithNewOp<gmir::TruncOp>(Op, DstGTy, WideRes.getResult());
 }
 
+/// Implements LegalizerHelper::fewerElementsVectorMultiEltType's pure-
+/// scalarize case (LegalizerHelper.cpp:5243-5310, reached via the
+/// G_ADD/G_MUL/etc. case block at 5691-5816): unmerge each vector operand
+/// into its scalar lanes, reapply Op's opcode per lane, reassemble via
+/// gmir.build_vector (mirrors G_BUILD_VECTOR, the real opcode
+/// buildMergeLikeInstr picks for a vector destination with scalar
+/// sources -- not G_MERGE_VALUES, which is scalar-dest-only). Returns
+/// false, leaving Op untouched, when Step isn't a pure-scalarize
+/// FewerElements action: a still-vector Step.NewType means this is
+/// FewerElements's other flavor -- splitting into a narrower multi-element
+/// sub-vector, not full scalarization (LegalizeMutations::scalarize's real
+/// implementation always returns a bare scalar for pure scalarize, so a
+/// still-vector NewType can only mean the other flavor) -- which is
+/// explicitly out of scope, left to the real downstream Legalizer, same
+/// graceful-fallback discipline as every unhandled action. The scalarize
+/// algorithm itself has nothing op-specific about it, so this is shared by
+/// every pattern's FewerElements dispatch case below (AddSubLegalizePattern,
+/// BitwiseLegalizePattern, MulLegalizePattern) rather than duplicated per
+/// op family.
+template <typename OpTy>
+bool rewriteFewerElements(OpTy Op, mlir::PatternRewriter &Rewriter,
+                          LegalizeActionStep Step, LLT DstTy,
+                          gmir::LLTType DstGTy) {
+  if (Step.Action != LegalizeActions::FewerElements || Step.NewType.isVector())
+    return false;
+
+  mlir::MLIRContext *Context = Rewriter.getContext();
+  gmir::LLTType LaneGTy = gmir::convertToGMIRType(*Context, Step.NewType);
+  unsigned NumLanes = DstTy.getNumElements();
+  mlir::Location Loc = Op.getLoc();
+  auto [LhsParts, RhsParts] =
+      unmergeNarrowOperands(Rewriter, Op, Loc, LaneGTy, NumLanes);
+
+  SmallVector<mlir::Value, 4> DstParts;
+  for (unsigned I = 0; I != NumLanes; ++I) {
+    auto Lane = OpTy::create(Rewriter, Loc, LaneGTy, LhsParts.getDsts()[I],
+                             RhsParts.getDsts()[I]);
+    DstParts.push_back(Lane.getResult());
+  }
+  Rewriter.replaceOpWithNewOp<gmir::BuildVectorOp>(Op, DstGTy, DstParts);
+  return true;
+}
+
 /// Shared constructor/member boilerplate for every gmir-level
 /// legalization pattern below: each needs a GMIRLegalizerInfoAdapter and
 /// a DataLayout reference, and an identical 3-line constructor
@@ -197,9 +240,9 @@ protected:
 /// `G_ADD`/`G_SUB`, querying the rule table exactly once per visit rather
 /// than registering one independently-matching pattern per candidate
 /// LegalizeAction (which would mean a redundant rule-table walk per
-/// candidate every time the driver visits a gmir.add/gmir.sub). NarrowScalar
-/// and WidenScalar are implemented; more actions are added to this same
-/// dispatch as this pass grows.
+/// candidate every time the driver visits a gmir.add/gmir.sub).
+/// NarrowScalar, WidenScalar, and FewerElements are implemented; more
+/// actions are added to this same dispatch as this pass grows.
 ///
 /// NarrowScalar case implements LegalizerHelper::narrowScalarAddSub's
 /// exact hi/lo+carry split algorithm, ported to build gmir ops instead of
@@ -211,6 +254,7 @@ protected:
 /// cancellation happen automatically via the same permanent downstream
 /// target Legalizer pass, exactly as they would for real GlobalISel's own
 /// narrowScalarAddSub output. WidenScalar case: see rewriteWidenScalar.
+/// FewerElements case: see rewriteFewerElements.
 template <typename OpTy, typename CarryOOp, typename CarryEOp>
 class AddSubLegalizePattern : public GMIRLegalizePatternBase<OpTy> {
   using Base = GMIRLegalizePatternBase<OpTy>;
@@ -263,20 +307,23 @@ public:
       return success();
     }
 
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+      return success();
+
     return failure();
   }
 };
 
 /// Dispatches on GMIRLegalizerInfoAdapter::getAction's single result for
 /// `G_AND`/`G_OR`/`G_XOR`, same one-getAction()-call-per-visit rationale
-/// as AddSubLegalizePattern above. NarrowScalar and WidenScalar are
-/// implemented.
+/// as AddSubLegalizePattern above. NarrowScalar, WidenScalar, and
+/// FewerElements are implemented.
 ///
 /// NarrowScalar case implements LegalizerHelper::narrowScalarBasic's
 /// algorithm: unlike add/sub there's no carry to thread between chunks --
 /// each narrow chunk pair is independent, so OpTy is just reapplied to
 /// every pair of unmerged pieces directly. WidenScalar case: see
-/// rewriteWidenScalar.
+/// rewriteWidenScalar. FewerElements case: see rewriteFewerElements.
 template <typename OpTy>
 class BitwiseLegalizePattern : public GMIRLegalizePatternBase<OpTy> {
   using Base = GMIRLegalizePatternBase<OpTy>;
@@ -317,16 +364,36 @@ public:
       return success();
     }
 
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+      return success();
+
     return failure();
   }
 };
 
 /// Dispatches on GMIRLegalizerInfoAdapter::getAction's single result for
 /// `G_MUL`, same one-getAction()-call-per-visit rationale as
-/// AddSubLegalizePattern/BitwiseLegalizePattern above. Only the
-/// WidenScalar case is implemented so far: schoolbook multiplication (the
-/// NarrowScalar case) is a distinct algorithm from either add/sub's carry
-/// chain or bitwise's independent chunks, and is added separately.
+/// AddSubLegalizePattern/BitwiseLegalizePattern above. NarrowScalar,
+/// WidenScalar, and FewerElements are all implemented.
+///
+/// NarrowScalar case implements LegalizerHelper::narrowScalarMul/
+/// multiplyRegisters's algorithm, but only the NumParts == 2 case: at
+/// exactly 2 limbs, multiplyRegisters's loop only ever executes its
+/// last-limb branch once, needing no carry-propagation op at all -- just
+/// the schoolbook 3-multiply/2-add shape: Lo = ALo*BLo (kept as-is, mod
+/// 2^NarrowBits); Hi = umulh(ALo,BLo) + ALo*BHi + AHi*BLo (each cross
+/// term's own overflow beyond NarrowBits is discarded, matching plain
+/// integer multiplication's mod-2^64 semantics for the full result).
+/// NumParts == 2 is the only split any in-tree target's LegalizerInfo is
+/// reachable from gmir to ever produce today (i686's X86LegalizerInfo
+/// clamps an s64 G_MUL straight to s32, a single 2-limb split) -- but
+/// that's a fact about the one target rule this has been checked against,
+/// not a structural guarantee from GMIRImporter's 64-bit integer cap
+/// (which bounds the *source* type's width, not what step size a target's
+/// LegalizerInfo::getAction chooses to narrow by). matchAndRewrite below
+/// bails explicitly on any other NumParts rather than assuming this can't
+/// happen. WidenScalar case: see rewriteWidenScalar. FewerElements case:
+/// see rewriteFewerElements.
 class MulLegalizePattern : public GMIRLegalizePatternBase<gmir::MulOp> {
   using Base = GMIRLegalizePatternBase<gmir::MulOp>;
   using Base::Adapter;
@@ -343,10 +410,47 @@ public:
     LegalizeActionStep Step =
         Adapter.getAction(getGenericOpcode<gmir::MulOp>(), {DstTy});
 
+    if (auto Split = gmir::getExactNarrowScalarSplit(Step, DstTy)) {
+      auto [NarrowTy, NumParts] = *Split;
+      // Only the 2-limb case is implemented (see the class doc comment for
+      // why a wider split is a real, if so-far-unobserved, possibility
+      // rather than something the importer's type cap rules out) -- bail
+      // explicitly rather than mishandle it, same
+      // fail-closed-to-the-real-downstream-Legalizer discipline as every
+      // other unhandled case in this file.
+      if (NumParts == 2) {
+        mlir::MLIRContext *Context = Rewriter.getContext();
+        gmir::LLTType NarrowGTy = gmir::convertToGMIRType(*Context, NarrowTy);
+        mlir::Location Loc = Op.getLoc();
+        auto [LhsParts, RhsParts] =
+            unmergeNarrowOperands(Rewriter, Op, Loc, NarrowGTy, NumParts);
+        mlir::Value ALo = LhsParts.getDsts()[0];
+        mlir::Value AHi = LhsParts.getDsts()[1];
+        mlir::Value BLo = RhsParts.getDsts()[0];
+        mlir::Value BHi = RhsParts.getDsts()[1];
+
+        auto Lo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+        auto HiHi = gmir::UMulHOp::create(Rewriter, Loc, NarrowGTy, ALo, BLo);
+        auto LoHi = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, ALo, BHi);
+        auto HiLo = gmir::MulOp::create(Rewriter, Loc, NarrowGTy, AHi, BLo);
+        auto Hi0 = gmir::AddOp::create(Rewriter, Loc, NarrowGTy,
+                                       HiHi.getResult(), LoHi.getResult());
+        auto Hi = gmir::AddOp::create(Rewriter, Loc, NarrowGTy, Hi0.getResult(),
+                                      HiLo.getResult());
+
+        SmallVector<mlir::Value, 2> DstParts{Lo.getResult(), Hi.getResult()};
+        Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+        return success();
+      }
+    }
+
     if (Step.Action == LegalizeActions::WidenScalar) {
       rewriteWidenScalar(Op, Rewriter, Step.NewType);
       return success();
     }
+
+    if (rewriteFewerElements(Op, Rewriter, Step, DstTy, DstGTy))
+      return success();
 
     return failure();
   }

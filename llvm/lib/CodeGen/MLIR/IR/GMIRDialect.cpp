@@ -107,21 +107,18 @@ void StoreOp::getEffects(SmallVectorImpl<mlir::SideEffects::EffectInstance<
   }
 }
 
-// Hand-written verifiers for GMIR_UnmergeOp/GMIR_MergeOp (`hasVerifier = 1`
-// in GMIRDialect.td -- ODS only declares these, it doesn't define them,
-// same as the BranchOpInterface/MemoryEffectsOpInterface methods above).
-// No stock ODS trait expresses "all *results* share one type"
-// (SameOperandsAndResultType doesn't fit either op: gmir.unmerge's single
-// operand legitimately differs in type from its results, and gmir.merge's
-// single result legitimately differs from its operands), so each is a
-// plain hand-rolled check, matching this file's existing style of direct,
-// unabstracted per-op logic rather than a shared two-op helper. Besides
-// the "all same type" check, also require the piece count times that
-// shared width to add up to the wide side's width (mirrors
-// buildUnmerge/buildMergeValues's own precondition: "the entire register
-// (and no more) must be covered by the input registers") -- with
+// Hand-written verifiers for GMIR_UnmergeOp/GMIR_MergeOp/GMIR_BuildVectorOp
+// (`hasVerifier = 1` in GMIRDialect.td -- ODS only declares these, it
+// doesn't define them, same as the BranchOpInterface/
+// MemoryEffectsOpInterface methods above). No stock ODS trait expresses
+// "all *results* share one type" (SameOperandsAndResultType doesn't fit
+// any of the three: gmir.unmerge's single operand legitimately differs in
+// type from its results, and gmir.merge/gmir.build_vector's single result
+// legitimately differs from their operands), so each is a plain
+// hand-rolled check, matching this file's existing style of direct,
+// unabstracted per-op logic rather than a shared helper. With
 // useDefaultTypePrinterParser on, gmir IR round-trips through text, so a
-// width mismatch here is not something only correctly-constructed C++
+// shape mismatch here is not something only correctly-constructed C++
 // callers can produce.
 LogicalResult UnmergeOp::verify() {
   if (getDsts().empty())
@@ -133,6 +130,20 @@ LogicalResult UnmergeOp::verify() {
   auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
   if (Ty.getScalarSizeInBits() == 0 || SrcTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  if (Ty.getNumElements() != 0)
+    return emitOpError("results must be scalar");
+  // Two distinct shapes, both real G_UNMERGE_VALUES uses (see the op's doc
+  // comment): a vector source splits into its per-element scalar lanes
+  // (count-based -- each dst is one element, not a bit-width fraction),
+  // while a scalar source splits into narrower bit-width chunks (the
+  // original, sum-based check).
+  if (SrcTy.getNumElements() != 0) {
+    if (SrcTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
+      return emitOpError("results must match the operand's element width");
+    if (SrcTy.getNumElements() != getDsts().size())
+      return emitOpError("result count must match the operand's element count");
+    return success();
+  }
   if (SrcTy.getScalarSizeInBits() !=
       Ty.getScalarSizeInBits() * getDsts().size())
     return emitOpError("result bit widths must sum to the operand's width");
@@ -155,16 +166,46 @@ LogicalResult MergeOp::verify() {
   return success();
 }
 
+// See the shared doc comment above UnmergeOp::verify(). The vector-lane
+// analogue of MergeOp::verify()'s bit-width-sum check: count- and
+// element-width-based instead of a bit-width sum, since a vector's total
+// bit width isn't the quantity that has to match here.
+LogicalResult BuildVectorOp::verify() {
+  if (getSrcs().empty())
+    return emitOpError("expected at least one operand");
+  auto Ty = cast<gmir::LLTType>(getSrcs().front().getType());
+  for (mlir::Value Src : getSrcs().drop_front())
+    if (Src.getType() != Ty)
+      return emitOpError("all operands must have the same type");
+  auto DstTy = cast<gmir::LLTType>(getDst().getType());
+  if (Ty.getScalarSizeInBits() == 0 || DstTy.getScalarSizeInBits() == 0)
+    return emitOpError("expected non-pointer operand and result types");
+  if (Ty.getNumElements() != 0)
+    return emitOpError("operands must be scalar");
+  if (DstTy.getNumElements() != getSrcs().size())
+    return emitOpError("result element count must match the operand count");
+  if (DstTy.getScalarSizeInBits() != Ty.getScalarSizeInBits())
+    return emitOpError("result element width must match the operands' width");
+  return success();
+}
+
 // Hand-written verifiers for GMIR_AnyExtOp/GMIR_TruncOp (`hasVerifier = 1`
 // in GMIRDialect.td, same reason as UnmergeOp/MergeOp above): each checks
 // that the width relationship the op's whole purpose depends on actually
 // holds -- no stock ODS trait expresses "result strictly wider/narrower
-// than the operand".
+// than the operand". The element-width check alone doesn't rule out a
+// vector operand paired with a scalar result (or a mismatched element
+// count/scalability): getScalarSizeInBits() only ever inspects the
+// element width, so both slip through undetected without an explicit
+// shape check too.
 LogicalResult AnyExtOp::verify() {
   auto SrcTy = cast<gmir::LLTType>(getSrc().getType());
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  if (SrcTy.getNumElements() != ResTy.getNumElements() ||
+      SrcTy.getIsScalable() != ResTy.getIsScalable())
+    return emitOpError("vector shape must match between operand and result");
   if (ResTy.getScalarSizeInBits() <= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be wider than the operand");
   return success();
@@ -175,6 +216,9 @@ LogicalResult TruncOp::verify() {
   auto ResTy = cast<gmir::LLTType>(getResult().getType());
   if (SrcTy.getScalarSizeInBits() == 0 || ResTy.getScalarSizeInBits() == 0)
     return emitOpError("expected non-pointer operand and result types");
+  if (SrcTy.getNumElements() != ResTy.getNumElements() ||
+      SrcTy.getIsScalable() != ResTy.getIsScalable())
+    return emitOpError("vector shape must match between operand and result");
   if (ResTy.getScalarSizeInBits() >= SrcTy.getScalarSizeInBits())
     return emitOpError("result must be narrower than the operand");
   return success();
