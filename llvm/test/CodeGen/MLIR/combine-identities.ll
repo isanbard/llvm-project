@@ -39,6 +39,12 @@
 ; Both functions are FileChecked the same way regardless, for consistency
 ; with the rest of this file and because the ASM checks don't depend on
 ; which specific reason the divergence exists for.
+;
+; *_reassoc_const (ReassociateConstOpPattern, GMIRCombiner.cpp) port
+; DAGCombiner.cpp's reassociateOpsCommutative -- shared identically by
+; visitADD/MUL/AND/OR/XOR: `(op (op x, c1), c2) -> (op x, (op c1, c2))`.
+; (x+3)+4 -> x+7, etc.: both original ops collapse into a single op
+; against the combined constant.
 
 define i32 @add_zero(i32 %x) {
   %r = add i32 %x, 0
@@ -235,3 +241,88 @@ define i32 @mul_neg_one_lhs(i32 %x) {
 ; ASM-LABEL: mul_neg_one_lhs:
 ; ASM-NOT: imull
 ; ASM: negl %eax
+
+define i32 @add_reassoc_const(i32 %x) {
+  %a = add i32 %x, 3
+  %r = add i32 %a, 4
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @add_reassoc_const
+; GMIR: gmir.constant 7
+; GMIR: gmir.add
+; GMIR-NOT: gmir.add
+; GMIR: return
+; ASM-LABEL: add_reassoc_const:
+; ASM: leal 7(%rdi), %eax
+
+define i32 @mul_reassoc_const(i32 %x) {
+  %a = mul i32 %x, 3
+  %r = mul i32 %a, 4
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @mul_reassoc_const
+; GMIR: gmir.constant 12
+; GMIR: gmir.mul
+; GMIR-NOT: gmir.mul
+; GMIR: return
+; ASM-LABEL: mul_reassoc_const:
+; ASM: imull $12, %edi, %eax
+
+define i32 @and_reassoc_const(i32 %x) {
+  %a = and i32 %x, 240
+  %r = and i32 %a, 255
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @and_reassoc_const
+; GMIR: gmir.constant 240
+; GMIR: gmir.and
+; GMIR-NOT: gmir.and
+; GMIR: return
+; ASM-LABEL: and_reassoc_const:
+; ASM: andl $240, %eax
+
+define i32 @or_reassoc_const(i32 %x) {
+  %a = or i32 %x, 1
+  %r = or i32 %a, 2
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @or_reassoc_const
+; GMIR: gmir.constant 3
+; GMIR: gmir.or
+; GMIR-NOT: gmir.or
+; GMIR: return
+; ASM-LABEL: or_reassoc_const:
+; ASM: orl $3, %eax
+
+define i32 @xor_reassoc_const(i32 %x) {
+  %a = xor i32 %x, 1
+  %r = xor i32 %a, 3
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_reassoc_const
+; GMIR: gmir.constant 2
+; GMIR: gmir.xor
+; GMIR-NOT: gmir.xor
+; GMIR: return
+; ASM-LABEL: xor_reassoc_const:
+; ASM: xorl $2, %eax
+
+; Regression case for a real bug found in review: without XorOp::fold's
+; x^x->0 identity, reducing %n to %b here (via XorSelfCancelPattern)
+; rewires %r's operands to (b, b) -- a live x^x that nothing folds away.
+; With the identity present, the whole chain collapses to a constant.
+; This exercises the interaction directly: XorSelfCancelPattern must run
+; and its result must then be re-folded by XorOp::fold, not left as a
+; dangling x^x.
+define i32 @xor_chain_self_cancel_then_zero(i32 %a, i32 %b) {
+  %m = xor i32 %a, %b
+  %n = xor i32 %m, %a
+  %r = xor i32 %n, %b
+  ret i32 %r
+}
+; GMIR-LABEL: func.func @xor_chain_self_cancel_then_zero
+; GMIR-NOT: gmir.xor
+; GMIR: gmir.constant 0
+; GMIR: return
+; ASM-LABEL: xor_chain_self_cancel_then_zero:
+; ASM: xorl %eax, %eax
