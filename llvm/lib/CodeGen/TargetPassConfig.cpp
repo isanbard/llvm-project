@@ -1026,6 +1026,20 @@ bool TargetPassConfig::addCoreISelPasses() {
   } else if (Selector == SelectorType::GlobalISel) {
     TM->setFastISel(false);
     TM->setGlobalISel(true);
+  } else if (Selector == SelectorType::MLIRISel) {
+    // MLIRISel has no abort-mode flag of its own (it always wants graceful
+    // fallback), so force this to Disable rather than leaving it at its
+    // default (Enable). Without this, some targets' GlobalISel pass
+    // additions are still gated on isGlobalISelAbortEnabled() -- e.g.
+    // X86PassConfig::addGlobalInstructionSelect() conditionally adds an
+    // extra X86GlobalBaseRegLegacyPass when it's true -- producing a
+    // pass combination (that extra pass + our always-graceful
+    // ResetMachineFunctionPass still falling through to SelectionDAG) that
+    // real GlobalISel can never hit (Enable there means report_fatal_error,
+    // never reaching the fallback), and which breaks legacy-PassManager
+    // scheduling of 'Function Alias Analysis Results' for the fallback DAG
+    // selector ("Unable to schedule pass").
+    TM->Options.GlobalISelAbort = GlobalISelAbortMode::Disable;
   }
 
   // FIXME: Injecting into the DAGISel pipeline seems to cause issues with
@@ -1070,27 +1084,48 @@ bool TargetPassConfig::addCoreISelPasses() {
   // in builds without MLIR ISel support, in which case we just skip adding
   // any pass here and fall through to SelectionDAG below, same as if
   // -enable-mlir-isel had never been passed.
+  //
+  // The pass that emits generic MIR (createMLIRInstructionSelectPass(),
+  // MLIRInstructionSelect) is only half of what GlobalISel's own branch
+  // above does: MIR it builds still needs Legalize/RegBankSelect/
+  // InstructionSelect to run before anything actually consumes it, or it
+  // just sits there unselected while nothing marks FailedISel. Reusing
+  // these same addLegalizeMachineIR()/addRegBankSelect()/
+  // addGlobalInstructionSelect() virtuals -- rather than adding new
+  // MLIRISel-specific ones -- gets legalization for free too: the target's
+  // existing GlobalISel Legalizer pass legalizes the generic MIR the
+  // translator emits, so a dedicated MLIR-side legalizer isn't needed for
+  // this to work correctly.
   if (Selector == SelectorType::MLIRISel) {
     SaveAndRestore SavedAddingMachinePasses(AddingMachinePasses, true);
-    if (MachineFunctionPass *MLIRISel = createMLIRInstructionSelectPass())
+    if (MachineFunctionPass *MLIRISel = createMLIRInstructionSelectPass()) {
       addPass(MLIRISel);
-    else
+      addPreLegalizeMachineIR();
+      if (addLegalizeMachineIR())
+        return true;
+      addPreRegBankSelect();
+      if (addRegBankSelect())
+        return true;
+      addPreGlobalInstructionSelect();
+      if (addGlobalInstructionSelect())
+        return true;
+    } else {
       WithColor::warning()
           << "-enable-mlir-isel was passed, but this build wasn't "
              "configured with -DLLVM_ENABLE_MLIR_ISEL=ON; falling back to "
              "the normal instruction selector.\n";
+    }
   }
 
   // Pass to reset the MachineFunction if the ISel failed. Outside of the above
   // if so that the verifier is not added to it. GlobalISel and MLIRISel both
   // may leave partially-built MIR behind on failure that needs to be wiped
   // before SelectionDAG runs on a clean MachineFunction, but each selector
-  // controls its own abort-vs-fallback behavior independently: reusing
-  // isGlobalISelAbortEnabled() for MLIRISel would inherit
-  // TargetOptions::GlobalISelAbort's default of Enable (abort), causing
-  // -enable-mlir-isel to hard-abort via report_fatal_error instead of
-  // falling back -- MLIRISel has no abort-mode flag of its own (it always
-  // wants graceful fallback), so it always resets rather than aborting.
+  // controls its own abort-vs-fallback behavior independently: MLIRISel has
+  // no abort-mode flag of its own (it always wants graceful fallback), so
+  // it always resets rather than aborting -- redundant with GlobalISelAbort
+  // already being forced to Disable above, but explicit here rather than
+  // depending on that.
   if (Selector == SelectorType::GlobalISel)
     addPass(createResetMachineFunctionPass(
         reportDiagnosticWhenGlobalISelFallback(), isGlobalISelAbortEnabled()));

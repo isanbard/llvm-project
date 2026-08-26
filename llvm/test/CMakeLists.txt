@@ -33,6 +33,7 @@ llvm_canonicalize_cmake_booleans(
   LLVM_HAS_LOGF128
   LLVM_ENABLE_ONDISK_CAS
   LLVM_HAVE_OPENCSD
+  LLVM_ENABLE_MLIR_ISEL
   )
 
 configure_lit_site_cfg(
