@@ -41,6 +41,9 @@ template <> unsigned getGenericOpcode<gmir::OrOp>() {
 template <> unsigned getGenericOpcode<gmir::XorOp>() {
   return TargetOpcode::G_XOR;
 }
+template <> unsigned getGenericOpcode<gmir::MulOp>() {
+  return TargetOpcode::G_MUL;
+}
 
 /// Thin wrapper around a target's LegalizerInfo, letting patterns below
 /// ask "what does the target's *existing* legality rules say about this
@@ -145,6 +148,32 @@ unmergeNarrowOperands(mlir::PatternRewriter &Rewriter, OpTy Op,
 
 namespace {
 
+/// Implements the single WidenScalar action shared verbatim by
+/// `G_ADD`/`G_AND`/`G_MUL`/`G_OR`/`G_SUB`/`G_XOR` (LegalizerHelper.cpp's
+/// widenScalar switch): any-extend both operands up to the wider legal
+/// type, re-run Op there, then truncate the result back down. `G_ANYEXT`,
+/// not `ZEXT`/`SEXT`, is correct for all six -- each one's low-N result
+/// bits depend only on the low-N input bits, so the extended high bits'
+/// actual value never affects the truncated result. Unlike the
+/// NarrowScalar split above, there's no multi-piece bookkeeping at all:
+/// exactly one any-extend per operand, one op, one truncate. Shared by
+/// every pattern's WidenScalar dispatch case below (AddSubLegalizePattern,
+/// BitwiseLegalizePattern, MulLegalizePattern) so the sequence is written
+/// once rather than duplicated per op family.
+template <typename OpTy>
+void rewriteWidenScalar(OpTy Op, mlir::PatternRewriter &Rewriter, LLT WideTy) {
+  auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+  mlir::MLIRContext *Context = Rewriter.getContext();
+  gmir::LLTType WideGTy = gmir::convertToGMIRType(*Context, WideTy);
+  mlir::Location Loc = Op.getLoc();
+
+  auto LhsWide = gmir::AnyExtOp::create(Rewriter, Loc, WideGTy, Op.getLhs());
+  auto RhsWide = gmir::AnyExtOp::create(Rewriter, Loc, WideGTy, Op.getRhs());
+  auto WideRes = OpTy::create(Rewriter, Loc, WideGTy, LhsWide.getResult(),
+                              RhsWide.getResult());
+  Rewriter.replaceOpWithNewOp<gmir::TruncOp>(Op, DstGTy, WideRes.getResult());
+}
+
 /// Shared constructor/member boilerplate for every gmir-level
 /// legalization pattern below: each needs a GMIRLegalizerInfoAdapter and
 /// a DataLayout reference, and an identical 3-line constructor
@@ -168,9 +197,9 @@ protected:
 /// `G_ADD`/`G_SUB`, querying the rule table exactly once per visit rather
 /// than registering one independently-matching pattern per candidate
 /// LegalizeAction (which would mean a redundant rule-table walk per
-/// candidate every time the driver visits a gmir.add/gmir.sub). Only the
-/// NarrowScalar case is implemented so far; more actions are added to
-/// this same dispatch as this pass grows.
+/// candidate every time the driver visits a gmir.add/gmir.sub). NarrowScalar
+/// and WidenScalar are implemented; more actions are added to this same
+/// dispatch as this pass grows.
 ///
 /// NarrowScalar case implements LegalizerHelper::narrowScalarAddSub's
 /// exact hi/lo+carry split algorithm, ported to build gmir ops instead of
@@ -181,7 +210,7 @@ protected:
 /// further legalization (e.g. the i1 carry type) and any merge/unmerge
 /// cancellation happen automatically via the same permanent downstream
 /// target Legalizer pass, exactly as they would for real GlobalISel's own
-/// narrowScalarAddSub output.
+/// narrowScalarAddSub output. WidenScalar case: see rewriteWidenScalar.
 template <typename OpTy, typename CarryOOp, typename CarryEOp>
 class AddSubLegalizePattern : public GMIRLegalizePatternBase<OpTy> {
   using Base = GMIRLegalizePatternBase<OpTy>;
@@ -229,19 +258,25 @@ public:
       return success();
     }
 
+    if (Step.Action == LegalizeActions::WidenScalar) {
+      rewriteWidenScalar(Op, Rewriter, Step.NewType);
+      return success();
+    }
+
     return failure();
   }
 };
 
 /// Dispatches on GMIRLegalizerInfoAdapter::getAction's single result for
 /// `G_AND`/`G_OR`/`G_XOR`, same one-getAction()-call-per-visit rationale
-/// as AddSubLegalizePattern above. Only the NarrowScalar case is
-/// implemented so far.
+/// as AddSubLegalizePattern above. NarrowScalar and WidenScalar are
+/// implemented.
 ///
 /// NarrowScalar case implements LegalizerHelper::narrowScalarBasic's
 /// algorithm: unlike add/sub there's no carry to thread between chunks --
 /// each narrow chunk pair is independent, so OpTy is just reapplied to
-/// every pair of unmerged pieces directly.
+/// every pair of unmerged pieces directly. WidenScalar case: see
+/// rewriteWidenScalar.
 template <typename OpTy>
 class BitwiseLegalizePattern : public GMIRLegalizePatternBase<OpTy> {
   using Base = GMIRLegalizePatternBase<OpTy>;
@@ -274,6 +309,42 @@ public:
         DstParts.push_back(Chunk.getResult());
       }
       Rewriter.replaceOpWithNewOp<gmir::MergeOp>(Op, DstGTy, DstParts);
+      return success();
+    }
+
+    if (Step.Action == LegalizeActions::WidenScalar) {
+      rewriteWidenScalar(Op, Rewriter, Step.NewType);
+      return success();
+    }
+
+    return failure();
+  }
+};
+
+/// Dispatches on GMIRLegalizerInfoAdapter::getAction's single result for
+/// `G_MUL`, same one-getAction()-call-per-visit rationale as
+/// AddSubLegalizePattern/BitwiseLegalizePattern above. Only the
+/// WidenScalar case is implemented so far: schoolbook multiplication (the
+/// NarrowScalar case) is a distinct algorithm from either add/sub's carry
+/// chain or bitwise's independent chunks, and is added separately.
+class MulLegalizePattern : public GMIRLegalizePatternBase<gmir::MulOp> {
+  using Base = GMIRLegalizePatternBase<gmir::MulOp>;
+  using Base::Adapter;
+  using Base::DL;
+
+public:
+  using Base::Base;
+
+  LogicalResult
+  matchAndRewrite(gmir::MulOp Op,
+                  mlir::PatternRewriter &Rewriter) const override {
+    auto DstGTy = cast<gmir::LLTType>(Op.getResult().getType());
+    LLT DstTy = gmir::convertLLT(DstGTy, DL);
+    LegalizeActionStep Step =
+        Adapter.getAction(getGenericOpcode<gmir::MulOp>(), {DstTy});
+
+    if (Step.Action == LegalizeActions::WidenScalar) {
+      rewriteWidenScalar(Op, Rewriter, Step.NewType);
       return success();
     }
 
@@ -310,6 +381,7 @@ gmir::LegalizerPatternCache::get(mlir::MLIRContext &Context,
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
   Patterns.add<BitwiseLegalizePattern<gmir::XorOp>>(
       &Context, GMIRLegalizerInfoAdapter(LI), DL);
+  Patterns.add<MulLegalizePattern>(&Context, GMIRLegalizerInfoAdapter(LI), DL);
 
   return Cache.try_emplace(Key, std::move(Patterns)).first->second;
 }
