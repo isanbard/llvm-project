@@ -66,6 +66,8 @@ class APFloat;
   case TargetOpcode::G_VECREDUCE_FMIN:                                         \
   case TargetOpcode::G_VECREDUCE_FMAXIMUM:                                     \
   case TargetOpcode::G_VECREDUCE_FMINIMUM:                                     \
+  case TargetOpcode::G_VECREDUCE_FMAXIMUMNUM:                                  \
+  case TargetOpcode::G_VECREDUCE_FMINIMUMNUM:                                  \
   case TargetOpcode::G_VECREDUCE_ADD:                                          \
   case TargetOpcode::G_VECREDUCE_MUL:                                          \
   case TargetOpcode::G_VECREDUCE_AND:                                          \
@@ -83,6 +85,8 @@ class APFloat;
   case TargetOpcode::G_VECREDUCE_FMIN:                                         \
   case TargetOpcode::G_VECREDUCE_FMAXIMUM:                                     \
   case TargetOpcode::G_VECREDUCE_FMINIMUM:                                     \
+  case TargetOpcode::G_VECREDUCE_FMAXIMUMNUM:                                  \
+  case TargetOpcode::G_VECREDUCE_FMINIMUMNUM:                                  \
   case TargetOpcode::G_VECREDUCE_ADD:                                          \
   case TargetOpcode::G_VECREDUCE_MUL:                                          \
   case TargetOpcode::G_VECREDUCE_AND:                                          \
